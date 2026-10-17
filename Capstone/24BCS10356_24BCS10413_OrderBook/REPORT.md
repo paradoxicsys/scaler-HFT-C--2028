@@ -292,7 +292,7 @@ Graviton only (§3.1); hardware counters were unavailable on the Ryzen (§3.2).
 
 Full reports: `results/perf_report_{A,B,C}.txt`.
 
-## 6. Revision notes (branch `2024bcs10413`)
+## 6. Revision notes (branch `24bcs10413`)
 
 Defects found by auditing the code against the spec, each with a regression test:
 
