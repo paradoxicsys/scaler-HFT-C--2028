@@ -32,7 +32,11 @@ for IMPL in A B C; do
   perf report -i "$OUT/perf_$IMPL.data" --stdio --no-children > "$OUT/perf_report_${IMPL}_full.txt" 2>/dev/null
   sed -n '1,120p' "$OUT/perf_report_${IMPL}_full.txt" > "$OUT/perf_report_$IMPL.txt"
   rm -f "$OUT/perf_report_${IMPL}_full.txt"
-  echo "wrote $OUT/perf_report_$IMPL.txt"
+  # The call-graph excerpt above only reaches the top few symbols, so also
+  # save a flat profile (self time per symbol, every symbol >= 0.5 %).
+  perf report -i "$OUT/perf_$IMPL.data" --stdio --no-children -g none --percent-limit 0.5 \
+    > "$OUT/perf_report_${IMPL}_flat.txt" 2>/dev/null
+  echo "wrote $OUT/perf_report_$IMPL.txt and $OUT/perf_report_${IMPL}_flat.txt"
 done
 
 echo "=== perf stat: workload generation only (baseline) ==="

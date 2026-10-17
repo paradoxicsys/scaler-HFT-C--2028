@@ -29,7 +29,8 @@ return value, the BBO, and every level of `get_bids(10)` / `get_asks(10)`. It al
 hand-written edge cases (empty book, unknown and double cancel, 3-level book asked for 10, BBO
 falling to the next level, zero/negative/huge depth, invalid price or quantity, id 2^64-1).
 **A PASS, B PASS, C PASS: all implementations produce identical results** on both machines
-(`results/verify.txt`, `results/x86/verify.txt`). Checking against a reference rather than
+(`results/x86/verify.txt`; on Graviton, `results/verify.txt` comes from the earlier harness that
+compared B and C with A). Checking against a reference rather than
 against A matters: with A deliberately broken (emptied levels never erased), the earlier
 A-as-yardstick harness failed all three books; the current one fails A alone.
 
@@ -146,8 +147,9 @@ and 8.1× faster on the Ryzen.
 - **A** allocates a hash node and descends about 13 red-black-tree nodes per add. perf record
   puts 60 % of its samples in `add_order`/`cancel_order`, plus libstdc++ hash-table internals.
 - **B** walks the id tree (`std::map`, up to ~500k entries, ~19 levels deep) on every add and cancel, then
-  binary-searches the level vector. A cancel also scans about 50 orders in the level, so cancel
-  is B's worst operation (33 % of samples). perf record also shows 7.4 % in
+  binary-searches the level vector. A cancel also scans the level's order list linearly (13.5
+  orders on average over the run: a level holds 26 orders on average when a cancel arrives and
+  about 50 by the end), so cancel is B's worst operation (33 % of samples). perf record also shows 7.4 % in
   `vector::_M_insert_aux`: inserting a new level moves every later `PriceLevel` one slot.
   Each holds its own vector, so this is a move per element, not a single memmove. Another 5.9 %
   is `_Rb_tree_rebalance_for_erase` from the id tree.
@@ -166,10 +168,12 @@ and 8.1× faster on the Ryzen.
 miss *rate* (≈5.5 %), but B executes almost twice as many branches. Each tree descent compares
 `key < node->key` with a random id or price, and the predictor can't learn a coin flip. A does
 one tree descent per op. B does two (id tree and binary search), plus the scan loop in
-`remove_order`, whose exit point is random and mispredicts once per cancel. C's only
-data-dependent branches are the short probe loop (about 1.5 probes at load ≤ 0.5) and "did this
-level just become empty/non-empty", which is rare once about 50 orders rest per level. That is why
-C's rate is half the others' and its total is 4.6× below A's.
+`remove_order`, whose exit point is random and mispredicts once per cancel. Apart from picking the
+buy or sell side (§4.6, item 5), C's data-dependent branches are the short probe loop (about 1.5
+probes expected at load ≤ 0.5) and "did this level just become empty/non-empty", which is rare
+once tens of orders rest per level. That is why C's rate is half the others' and its total is
+4.6× below A's. All three counts also include generating the workload (§3.1), which is the same
+for each.
 
 ### 4.3 Cache behaviour
 **B has the most L1 misses (25.2 M), then A (10.9 M), then C (3.3 M). dTLB misses follow the same
@@ -208,9 +212,11 @@ constructing the book and **0** during the timed loop; A takes 2,064 during cons
 ### 4.5 Production choice
 I would deploy **C**.
 - **Latency:** lowest total time, and the lowest add and cancel latency.
-- **Predictability:** no allocation after start-up, no rebalancing, no reallocation. Its worst
-  cases are bounded: a scan of 79 bitmap words when the best level empties, and a probe loop
-  capped by the load factor. A and B call the allocator on every add and cancel and rebalance
+- **Predictability:** no allocation in add, cancel or BBO after start-up (the order table grows
+  only past 2^20 live orders; depth queries return a `std::vector` in every design), no
+  rebalancing, no reallocation. Its slow paths are bounded or kept short: a scan of at most 79
+  bitmap words when the best level empties, and a probe loop whose expected length the load
+  factor keeps short. A and B call the allocator on every add and cancel and rebalance
   trees, which is where tail-latency spikes come from. The Ryzen percentiles bear this out
   (§3.3): C's p99.9 is ~600 ns for both add and cancel, against ~1–1.9 µs for A and ~6.4–6.7 µs
   for B. B's add p99 (1.75 µs vs a 171 ns median) points at its occasional expensive adds: a new
@@ -290,7 +296,11 @@ Graviton only (§3.1); hardware counters were unavailable on the Ryzen (§3.2).
 | 4.3 % + 4.0 % `std::_Hashtable` internals | 5.9 % `_Rb_tree_rebalance_for_erase` | 7.3 % `OrderBookC::cancel_order` |
 | 3.0 % `unordered_map::emplace` | 4.7 % `std::_Rb_tree` (id map) | ≈10 % kernel code (unresolved `[k]` symbols) |
 
-Full reports: `results/perf_report_{A,B,C}.txt`.
+Saved excerpts: `results/perf_report_{A,B,C}.txt`, the first 120 lines of each call-graph
+report. They contain the top two symbols for A and B and the top five for C. The other
+percentages in this table and in §3.1/§4 are not in these excerpts (the full reports were not
+saved), so they cannot be re-checked from this repository. `scripts/perf_all.sh` now also saves a
+flat profile (`perf_report_X_flat.txt`, every symbol ≥ 0.5 %) so a re-run keeps them.
 
 ## 6. Revision notes (branch `24bcs10413`)
 

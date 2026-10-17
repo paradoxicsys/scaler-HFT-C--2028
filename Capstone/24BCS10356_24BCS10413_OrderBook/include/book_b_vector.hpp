@@ -9,15 +9,17 @@
 //  * Price levels : std::vector<PriceLevel> kept sorted so that the *back* of
 //                   the vector is the best price (bids ascending, asks
 //                   descending). Inserting a brand-new level is a binary
-//                   search + vector::insert (memmove); the best-price end is
-//                   the cheap end.
+//                   search + vector::insert, which moves every later
+//                   PriceLevel one slot (element-wise moves, since each holds
+//                   a vector); the best-price end is the cheap end.
 //  * Best price   : levels.back()  (O(1), contiguous memory)
 //  * Cancel       : tree find id -> tick (O(log N)), binary search the level,
 //                   then a linear scan of that level's order list, swap-remove.
 //
 //  N = live orders, L = non-empty levels on the side, k = orders at one level.
-//  add_order   : O(log N) tree insert + O(log L) search (+ O(L) memmove if new level)
+//  add_order   : O(log N) tree insert + O(log L) search (+ O(L) moves if new level)
 //  cancel_order: O(log N) tree find/erase + O(log L) search + O(k) scan
+//                (+ O(L) moves if the level empties)
 //  get_bbo     : O(1)
 //  get_bids/asks(d): O(d) (walk backwards from the end of the vector)
 #pragma once

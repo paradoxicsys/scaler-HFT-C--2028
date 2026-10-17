@@ -41,8 +41,8 @@ g++ -std=c++17 -O2 -Wall -Wextra -Iinclude -Isrc tests/test_orderbook.cpp -o tes
 or simply
 
 ```sh
-make            # same command as above
-make test       # builds test_orderbook too, runs it, then ./bench --verify
+make            # builds bench and test_orderbook (the two commands above)
+make test       # builds both, runs test_orderbook, then ./bench --verify
 make sanitize   # the tests + a 200k-op --verify under AddressSanitizer + UBSan
 # or
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build   # build/bench, build/test_orderbook
@@ -51,7 +51,9 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build   # build/bench
 
 `-g` and `-fno-omit-frame-pointer` only add symbols / keep frame pointers so
 that `perf record -g` gives readable call graphs. Code generation is plain `-O2`.
-No external libraries; the standard library only.
+No external libraries; the standard library only. (`__builtin_ctzll` in C and the
+empty `asm volatile` barrier in the benchmark are GCC/Clang compiler built-ins, not
+libraries.)
 
 ## Run the correctness test
 
@@ -130,7 +132,8 @@ the live-order bookkeeping needed to pick cancel targets are never timed.
 Workload (seed 42): 1,000,000 operations, ~70 % add / 20 % cancel / 10 %
 `get_bbo`, side 50/50, qty 1–100, uniformly random valid tick in the band, every
 cancel targets a currently-live order (if nothing is live the slot becomes an
-add — this happens 6 times at the very start). After every 100 operations one
+add; with seed 42 on libstdc++ this never happens, and in general it can only
+happen in the first few operations). After every 100 operations one
 extra "depth" operation calls `get_bids(10)` + `get_asks(10)` (10,000 of them,
 on top of the 1,000,000).
 
@@ -234,12 +237,14 @@ The required API is kept, with these additions / notes:
 | Price levels | `std::map<tick, qty>` per side (red-black tree) | `std::vector<PriceLevel>` per side, kept sorted, best at the back | `long qty[5000]` per side indexed by tick rank + 5000-bit occupancy bitmap |
 | Best price | `map.begin()` | `vector.back()` | cached `best` rank; on emptying, `ctz` scan of the bitmap |
 | Cancel lookup | hash → tick → `map.find` | id tree → tick → binary search → linear scan in level | probe → tick → direct array index |
-| add | O(1) avg + O(log L) | O(log N) + O(log L), + O(L) memmove for a new level | O(1) |
-| cancel | O(1) avg + O(log L) | O(log N) + O(log L) + O(k) | O(1) (worst O(L/64)) |
+| add | O(1) avg + O(log L) | O(log N) + O(log L), + O(L) element moves for a new level | O(1) avg |
+| cancel | O(1) avg + O(log L) | O(log N) + O(log L) + O(k), + O(L) element moves when the level empties | O(1) avg, + up to 79 bitmap words when the best level empties |
 | get_bbo | O(1) | O(1) | O(1) |
-| get_bids/asks(d) | O(d) | O(d) | O(d + L/64) |
+| get_bids/asks(d) | O(d) | O(d) | O(d + 79) worst (bitmap words scanned) |
 
 L = non-empty price levels on the side (≤ 5000), N = live orders, k = orders at one level.
+C's bitmap scans are bounded by the 5,000-slot price range (79 words of 64 bits), not by L.
+"avg" is the expected cost of a hash lookup.
 
 ### Design details
 
@@ -259,17 +264,20 @@ non-empty levels and a cached `best` rank. When the best level empties, the next
 with `__builtin_ctzll` over the bitmap. Orders live in a custom open-addressing hash table:
 16-byte slots `{id, tick, qty}`, Fibonacci hashing, linear probing, load factor ≤ 0.5 and
 backward-shift deletion (no tombstones). The side is implied by the tick. The table is
-allocated and filled once at construction, so the hot path never allocates.
+allocated and filled once at construction, so `add_order`, `cancel_order` and `get_bbo` never
+allocate afterwards (the table only grows past 2^20 live orders). `get_bids`/`get_asks` return
+a `std::vector` by value, as the API requires, so they allocate in all three designs.
 
 ## Collecting perf data on Linux
 
 ```sh
 make
-./bench --verify
-for i in A B C; do ./bench --impl $i | tee results/bench_$i.txt; done
-./scripts/perf_all.sh       # writes results/perf_stat_{A,B,C,gen}.txt and results/perf_report_{A,B,C}.txt
-./scripts/perf_all.sh results/x86   # same, into another directory (keeps the Graviton files intact)
+./scripts/bench_all.sh results/local   # tests, --verify and the A/B/C benchmarks
+./scripts/perf_all.sh results/local    # perf_stat_{A,B,C,gen}.txt, perf_report_{A,B,C}[_flat].txt
 ```
+
+Give each machine its own directory: `results/` itself holds the Graviton files and
+`results/x86/` the Ryzen ones, and both scripts overwrite what is in the directory they are given.
 
 `perf_all.sh` checks first that perf can open events and, if not, prints the
 `perf_event_paranoid` fix instead of failing five times.

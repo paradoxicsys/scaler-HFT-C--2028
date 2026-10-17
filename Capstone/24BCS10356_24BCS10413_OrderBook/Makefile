@@ -5,6 +5,8 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -g -fno-omit-frame-pointer
 SANFLAGS  = -std=c++17 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
 HEADERS   = include/*.hpp src/*.hpp
 
+all: bench test_orderbook
+
 bench: src/bench.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) -Iinclude -Isrc src/bench.cpp -o bench
 
@@ -30,4 +32,4 @@ clean:
 	rm -f bench test_orderbook test_orderbook_san bench_san
 	rm -rf bench.dSYM
 
-.PHONY: verify test sanitize clean
+.PHONY: all verify test sanitize clean
