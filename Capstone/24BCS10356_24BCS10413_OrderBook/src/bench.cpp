@@ -131,7 +131,7 @@ static RunResult run_once(const Workload& w) {
         const uint64_t t0 = now_ns();
         for (const Op& op : w.ops) {
             switch (op.type) {
-                case OpType::Add: book.add_order(op.id, op.side, op.tick, op.qty); break;
+                case OpType::Add: book.add_order_ticks(op.id, op.side, op.tick, op.qty); break;
                 case OpType::Cancel: chk += book.cancel_order(op.id); break;
                 case OpType::Bbo: chk = fold_bbo(chk, book.get_bbo()); break;
                 case OpType::Depth:
@@ -177,7 +177,7 @@ static RunResult run_once(const Workload& w) {
             switch (op.type) {
                 case OpType::Add: {
                     const uint64_t a = now_ns();
-                    book.add_order(op.id, op.side, op.tick, op.qty);
+                    book.add_order_ticks(op.id, op.side, op.tick, op.qty);
                     const uint64_t d = now_ns() - a;
                     t_add += d;
                     s_add.push_back(sample(d));
@@ -282,7 +282,7 @@ static int run_perf(const char* name, const Workload& w, long gen_faults) {
     const uint64_t t0 = now_ns();
     for (const Op& op : w.ops) {
         switch (op.type) {
-            case OpType::Add: book.add_order(op.id, op.side, op.tick, op.qty); break;
+            case OpType::Add: book.add_order_ticks(op.id, op.side, op.tick, op.qty); break;
             case OpType::Cancel: chk += book.cancel_order(op.id); break;
             case OpType::Bbo: chk = fold_bbo(chk, book.get_bbo()); break;
             case OpType::Depth:
@@ -448,6 +448,10 @@ static bool edge_cases(const char* name) {
         book.cancel_order(max_id) || book.get_bbo().has_ask) {
         std::printf("  [%s] id 2^64-1 handling wrong\n", name); ok = false;
     }
+    // a whole-number price is a price (75.00), not a tick count
+    if (!book.add_order(21, Side::Buy, 75, 4) || book.get_bids(10).back().price != 75.0) {
+        std::printf("  [%s] whole-number price handled wrong\n", name); ok = false;
+    }
     return ok;
 }
 
@@ -463,7 +467,7 @@ struct Expected {
 template <class Book>
 static bool step_matches(Book& book, const Op& op, const Expected& e) {
     bool ret = e.ret;
-    if (op.type == OpType::Add) ret = book.add_order(op.id, op.side, op.tick, op.qty);
+    if (op.type == OpType::Add) ret = book.add_order_ticks(op.id, op.side, op.tick, op.qty);
     else if (op.type == OpType::Cancel) ret = book.cancel_order(op.id);
     return ret == e.ret && book.get_bbo() == e.bbo && same_levels(book.get_bids(10), e.bids) &&
            same_levels(book.get_asks(10), e.asks);
@@ -489,7 +493,7 @@ static int run_verify(const Workload& w) {
     for (size_t i = 0; i < w.ops.size(); ++i) {
         const Op& op = w.ops[i];
         Expected e{true, {}, {}, {}};
-        if (op.type == OpType::Add) e.ret = ref.add_order(op.id, op.side, op.tick, op.qty);
+        if (op.type == OpType::Add) e.ret = ref.add_order_ticks(op.id, op.side, op.tick, op.qty);
         else if (op.type == OpType::Cancel) e.ret = ref.cancel_order(op.id);
         // the generator promises valid adds and cancels of live orders only
         if ((op.type == OpType::Add || op.type == OpType::Cancel) && !e.ret) workload_ok = false;

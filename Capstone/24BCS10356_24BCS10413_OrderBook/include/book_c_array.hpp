@@ -47,10 +47,10 @@ public:
     // would index qty[-2001].
     bool add_order(uint64_t id, Side side, double price, long qty) {
         int tick;
-        return price_to_tick(price, tick) && add_order(id, side, tick, qty);
+        return price_to_tick(price, tick) && add_order_ticks(id, side, tick, qty);
     }
 
-    bool add_order(uint64_t id, Side side, int tick, long qty) {
+    bool add_order_ticks(uint64_t id, Side side, int tick, long qty) {
         if (!valid_order(side, tick, qty)) return false;
         const bool inserted = id == kEmpty ? spare_insert(tick, static_cast<int32_t>(qty))
                                            : table_insert(id, tick, static_cast<int32_t>(qty));

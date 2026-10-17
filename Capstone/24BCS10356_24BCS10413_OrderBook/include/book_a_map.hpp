@@ -30,10 +30,10 @@ public:
     // non-finite price, qty <= 0, or an id that is already live.
     bool add_order(uint64_t id, Side side, double price, long qty) {
         int tick;
-        return price_to_tick(price, tick) && add_order(id, side, tick, qty);
+        return price_to_tick(price, tick) && add_order_ticks(id, side, tick, qty);
     }
 
-    bool add_order(uint64_t id, Side side, int tick, long qty) {
+    bool add_order_ticks(uint64_t id, Side side, int tick, long qty) {
         if (!valid_order(side, tick, qty)) return false;
         auto ins = orders_.emplace(id, OrderRec{tick, qty, side});
         if (!ins.second) return false;  // duplicate id

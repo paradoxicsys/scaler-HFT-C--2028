@@ -17,10 +17,10 @@ class ReferenceBook {
 public:
     bool add_order(uint64_t id, Side side, double price, long qty) {
         int tick;
-        return price_to_tick(price, tick) && add_order(id, side, tick, qty);
+        return price_to_tick(price, tick) && add_order_ticks(id, side, tick, qty);
     }
 
-    bool add_order(uint64_t id, Side side, int tick, long qty) {
+    bool add_order_ticks(uint64_t id, Side side, int tick, long qty) {
         if (!valid_order(side, tick, qty) || orders_.count(id) != 0) return false;
         orders_.emplace(id, Order{tick, qty});
         qty_at_[tick] += qty;

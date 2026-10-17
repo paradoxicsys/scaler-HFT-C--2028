@@ -3,9 +3,11 @@
 // Interface change vs. the assignment: prices are handled internally as
 // integer *ticks* (1 tick = 0.01). 100.01 -> 10001. The public API still
 // accepts/returns doubles (add_order(double), Level.price, BBO.*_price), but
-// every implementation also exposes a tick-based add_order overload, which is
-// what the benchmark uses so that all three designs are measured on the same
-// footing (no double->int conversion inside the timed region).
+// every implementation also exposes add_order_ticks(id, side, int tick, qty),
+// which is what the benchmark uses so that all three designs are measured on
+// the same footing (no double->int conversion inside the timed region). It has
+// its own name rather than being an add_order overload so that a whole-number
+// price such as add_order(id, Side::Buy, 75, 10) means 75.00, not 75 ticks.
 #pragma once
 
 #include <cmath>

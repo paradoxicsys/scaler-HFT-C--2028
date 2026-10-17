@@ -194,10 +194,15 @@ The required API is kept, with these additions / notes:
 
 * **Integer ticks.** Internally every implementation stores prices as `int`
   ticks (1 tick = 0.01, `100.01 → 10001`). `add_order(id, side, double price,
-  qty)` is still provided and converts with `lround(price * 100)`; each class
-  also has `add_order(id, side, int tick, qty)` which is what the benchmark
+  qty)` is still provided (see `price_to_tick()` below); each class also has
+  `add_order_ticks(id, side, int tick, qty)`, which is what the benchmark
   calls, so no float conversion sits inside the timed region. `Level.price`
   and `BBO.*_price` are still `double` (`tick / 100.0`).
+* The tick entry point has its own name on purpose. It used to be a second
+  `add_order` overload, so `add_order(1, Side::Buy, 75, 10)` picked the `int`
+  overload, meant 75 *ticks* (0.75) and was rejected, and a `long` price did
+  not compile (ambiguous call). Whole-number prices now mean what they say:
+  `add_order(1, Side::Buy, 75, 10)` rests at 75.00.
 * `Side`, `Level`, `BBO` are exactly as specified (`order_book_common.hpp`).
 * The three classes are `OrderBookA`, `OrderBookB`, `OrderBookC`; they are
   used through templates (not a virtual base) so the benchmark pays no

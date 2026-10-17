@@ -7,6 +7,7 @@
 // large enough never to grow. These tests cover what that leaves out:
 //   * every one of the 10,000 valid prices through the double API, and
 //     rejection of off-tick, out-of-band, non-finite and wrapping prices;
+//   * whole-number prices passed as int / long / unsigned;
 //   * a full 5,000-level side (depth, ordering, bitmap word boundaries in C);
 //   * random 64-bit ids including 0 and 2^64-1, duplicate adds, cancels of
 //     unknown or already-cancelled ids, re-use of a cancelled id, invalid
@@ -104,6 +105,25 @@ static void test_double_prices() {
 }
 
 // ---------------------------------------------------------------------------
+// Whole-number prices go through the price API. While the tick overload was
+// also named add_order, add_order(id, Buy, 75, 10) meant 75 ticks (0.75) and
+// was rejected, and a long price did not compile (ambiguous overload).
+// ---------------------------------------------------------------------------
+template <class Book>
+static void test_whole_number_prices() {
+    Book book;
+    const long ask_price = 101;
+    const unsigned far_ask = 120u;
+    CHECK(book.add_order(1, Side::Buy, 75, 10));         // int
+    CHECK(book.add_order(2, Side::Sell, ask_price, 4));  // long
+    CHECK(book.add_order(3, Side::Sell, far_ask, 1));    // unsigned
+    const BBO b = book.get_bbo();
+    CHECK(b.has_bid && b.bid_price == 75.0 && b.bid_qty == 10);
+    CHECK(b.has_ask && b.ask_price == 101.0 && b.ask_qty == 4);
+    CHECK(book.get_asks(5).size() == 2);
+}
+
+// ---------------------------------------------------------------------------
 // Emptying a full side in random order: the best level keeps moving, which in
 // C means scanning the occupancy bitmap across word boundaries.
 // ---------------------------------------------------------------------------
@@ -116,7 +136,7 @@ static void test_drain_full_book(uint32_t seed) {
     for (int t = kBidMinTick; t <= kAskMaxTick; ++t) {
         if (t == 10000) continue;
         const Side side = t <= kBidMaxTick ? Side::Buy : Side::Sell;
-        CHECK(book.add_order(id, side, t, 1 + t % 7) == ref.add_order(id, side, t, 1 + t % 7));
+        CHECK(book.add_order_ticks(id, side, t, 1 + t % 7) == ref.add_order_ticks(id, side, t, 1 + t % 7));
         ids.push_back(id++);
     }
     std::mt19937 rng(seed);
@@ -156,8 +176,8 @@ static void test_random_vs_reference(uint32_t seed, int n_ops) {
             const int off = static_cast<int>(rng() % 40);
             const int tick = side == Side::Buy ? kBidMaxTick - off : kAskMinTick + off;
             const long qty = 1 + static_cast<long>(rng() % 100);
-            got = book.add_order(id, side, tick, qty);
-            want = ref.add_order(id, side, tick, qty);
+            got = book.add_order_ticks(id, side, tick, qty);
+            want = ref.add_order_ticks(id, side, tick, qty);
             if (want) live.push_back(id);
         } else if (r < 85) {
             // cancel a live order
@@ -176,15 +196,15 @@ static void test_random_vs_reference(uint32_t seed, int n_ops) {
                 want = ref.cancel_order(id);
                 if (want) live.erase(std::find(live.begin(), live.end(), id));  // it had been re-added
             } else {
-                got = book.add_order(id, Side::Buy, kBidMaxTick, 1);
-                want = ref.add_order(id, Side::Buy, kBidMaxTick, 1);
+                got = book.add_order_ticks(id, Side::Buy, kBidMaxTick, 1);
+                want = ref.add_order_ticks(id, Side::Buy, kBidMaxTick, 1);
                 if (want) live.push_back(id);
             }
         } else if (r < 94) {
             // duplicate add of a live id (must be rejected)
             const uint64_t id = live[pick(live.size())];
-            got = book.add_order(id, Side::Sell, kAskMinTick, 5);
-            want = ref.add_order(id, Side::Sell, kAskMinTick, 5);
+            got = book.add_order_ticks(id, Side::Sell, kAskMinTick, 5);
+            want = ref.add_order_ticks(id, Side::Sell, kAskMinTick, 5);
         } else if (r < 97) {
             // invalid price or quantity (must be rejected)
             const int bad_ticks[] = {kBidMinTick - 1, 10000, kAskMaxTick + 1, kAskMinTick, -5};
@@ -192,12 +212,12 @@ static void test_random_vs_reference(uint32_t seed, int n_ops) {
             const uint64_t id = rng();
             if (rng() & 1) {
                 const int t = bad_ticks[pick(5)];
-                got = book.add_order(id, Side::Buy, t, 10);
-                want = ref.add_order(id, Side::Buy, t, 10);
+                got = book.add_order_ticks(id, Side::Buy, t, 10);
+                want = ref.add_order_ticks(id, Side::Buy, t, 10);
             } else {
                 const long q = bad_qty[pick(3)];
-                got = book.add_order(id, Side::Sell, kAskMinTick + 3, q);
-                want = ref.add_order(id, Side::Sell, kAskMinTick + 3, q);
+                got = book.add_order_ticks(id, Side::Sell, kAskMinTick + 3, q);
+                want = ref.add_order_ticks(id, Side::Sell, kAskMinTick + 3, q);
             }
         } else {
             // cancel an id that never existed
@@ -227,6 +247,7 @@ template <class Book>
 static void run_all(const char* name) {
     const int before = g_failures;
     test_double_prices<Book>();
+    test_whole_number_prices<Book>();
     test_drain_full_book<Book>(1);
     for (uint32_t seed = 1; seed <= 3; ++seed) test_random_vs_reference<Book>(seed, 200'000);
     std::printf("%-26s %s\n", name, g_failures == before ? "PASS" : "FAIL");
