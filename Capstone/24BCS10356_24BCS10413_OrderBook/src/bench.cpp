@@ -27,6 +27,7 @@
 #include "book_a_map.hpp"
 #include "book_b_vector.hpp"
 #include "book_c_array.hpp"
+#include "reference_book.hpp"
 #include "workload.hpp"
 
 using Clock = std::chrono::steady_clock;
@@ -367,7 +368,7 @@ static int run_bench(const char* name, const Workload& w, int runs, long gen_fau
 }
 
 // ----------------------------------------------------------------------------
-// Correctness: lock-step comparison of all three books on the same workload
+// Correctness: lock-step comparison of all three books with a reference model
 // ----------------------------------------------------------------------------
 static bool same_levels(const std::vector<Level>& a, const std::vector<Level>& b) {
     return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
@@ -450,6 +451,24 @@ static bool edge_cases(const char* name) {
     return ok;
 }
 
+// One book's agreement with the reference after an operation: the return
+// value of the add/cancel, the BBO, and every level of the 10-deep bid and
+// ask ladders.
+struct Expected {
+    bool ret;
+    BBO bbo;
+    std::vector<Level> bids, asks;
+};
+
+template <class Book>
+static bool step_matches(Book& book, const Op& op, const Expected& e) {
+    bool ret = e.ret;
+    if (op.type == OpType::Add) ret = book.add_order(op.id, op.side, op.tick, op.qty);
+    else if (op.type == OpType::Cancel) ret = book.cancel_order(op.id);
+    return ret == e.ret && book.get_bbo() == e.bbo && same_levels(book.get_bids(10), e.bids) &&
+           same_levels(book.get_asks(10), e.asks);
+}
+
 static int run_verify(const Workload& w) {
     std::printf("Running correctness test...\n\n");
     std::printf("Edge cases (empty book, unknown/double cancel, insufficient depth, invalid input):\n");
@@ -458,43 +477,48 @@ static int run_verify(const Workload& w) {
     bool okC = edge_cases<OrderBookC>("C");
     std::printf("  A: %s   B: %s   C: %s\n", okA ? "PASS" : "FAIL", okB ? "PASS" : "FAIL", okC ? "PASS" : "FAIL");
 
-    std::printf("Lock-step workload comparison (%zu ops, BBO + 10-level depth compared after every op):\n",
+    // Each book is checked against ReferenceBook (src/reference_book.hpp), a
+    // deliberately naive tick-array model, not against each other.
+    std::printf("Lock-step workload comparison against an independent reference model (%zu ops;\n"
+                "add/cancel result, BBO and 10-level bid/ask depth compared after every op):\n",
                 w.ops.size());
+    ReferenceBook ref;
     OrderBookA a; OrderBookB b; OrderBookC c;
-    size_t mismatches_B = 0, mismatches_C = 0, first_bad = 0;
+    size_t bad_A = 0, bad_B = 0, bad_C = 0, first_bad = 0;
+    bool workload_ok = true;
     for (size_t i = 0; i < w.ops.size(); ++i) {
         const Op& op = w.ops[i];
-        if (op.type == OpType::Add) {
-            a.add_order(op.id, op.side, op.tick, op.qty);
-            b.add_order(op.id, op.side, op.tick, op.qty);
-            c.add_order(op.id, op.side, op.tick, op.qty);
-        } else if (op.type == OpType::Cancel) {
-            const bool ra = a.cancel_order(op.id), rb = b.cancel_order(op.id), rc = c.cancel_order(op.id);
-            if (!ra) { std::printf("  A: cancel of live order %llu returned false\n", (unsigned long long)op.id); okA = false; }
-            if (rb != ra) ++mismatches_B;
-            if (rc != ra) ++mismatches_C;
-        }
-        const BBO ba = a.get_bbo(), bb = b.get_bbo(), bc = c.get_bbo();
-        const auto bidsA = a.get_bids(10), bidsB = b.get_bids(10), bidsC = c.get_bids(10);
-        const auto asksA = a.get_asks(10), asksB = b.get_asks(10), asksC = c.get_asks(10);
-        const bool okB_i = (bb == ba) && same_levels(bidsB, bidsA) && same_levels(asksB, asksA);
-        const bool okC_i = (bc == ba) && same_levels(bidsC, bidsA) && same_levels(asksC, asksA);
-        if (!okB_i) ++mismatches_B;
-        if (!okC_i) ++mismatches_C;
-        if ((!okB_i || !okC_i) && first_bad == 0) first_bad = i + 1;
+        Expected e{true, {}, {}, {}};
+        if (op.type == OpType::Add) e.ret = ref.add_order(op.id, op.side, op.tick, op.qty);
+        else if (op.type == OpType::Cancel) e.ret = ref.cancel_order(op.id);
+        // the generator promises valid adds and cancels of live orders only
+        if ((op.type == OpType::Add || op.type == OpType::Cancel) && !e.ret) workload_ok = false;
+        e.bbo = ref.get_bbo();
+        e.bids = ref.get_bids(10);
+        e.asks = ref.get_asks(10);
+        const bool okA_i = step_matches(a, op, e), okB_i = step_matches(b, op, e), okC_i = step_matches(c, op, e);
+        bad_A += !okA_i;
+        bad_B += !okB_i;
+        bad_C += !okC_i;
+        if ((!okA_i || !okB_i || !okC_i) && first_bad == 0) first_bad = i + 1;
     }
-    okB = okB && mismatches_B == 0;
-    okC = okC && mismatches_C == 0;
+    std::printf("  mismatching ops: A %zu, B %zu, C %zu\n", bad_A, bad_B, bad_C);
     if (first_bad) std::printf("  first mismatch at op #%zu\n", first_bad);
+    if (!workload_ok) std::printf("  workload error: an add was invalid or a cancel targeted a dead order\n");
+    okA = okA && bad_A == 0 && workload_ok;
+    okB = okB && bad_B == 0 && workload_ok;
+    okC = okC && bad_C == 0 && workload_ok;
 
     // independent cross-check: same checksum from the benchmark path
+    const uint64_t cr = run_once<ReferenceBook>(w).checksum;
     const uint64_t ca = run_once<OrderBookA>(w).checksum;
     const uint64_t cb = run_once<OrderBookB>(w).checksum;
     const uint64_t cc = run_once<OrderBookC>(w).checksum;
-    std::printf("Benchmark checksums: A=%llu B=%llu C=%llu\n\n", (unsigned long long)ca, (unsigned long long)cb,
-                (unsigned long long)cc);
-    okB = okB && cb == ca;
-    okC = okC && cc == ca;
+    std::printf("Benchmark checksums: reference=%llu A=%llu B=%llu C=%llu\n\n", (unsigned long long)cr,
+                (unsigned long long)ca, (unsigned long long)cb, (unsigned long long)cc);
+    okA = okA && ca == cr;
+    okB = okB && cb == cr;
+    okC = okC && cc == cr;
 
     std::printf("Implementation A: %s\n", okA ? "PASS" : "FAIL");
     std::printf("Implementation B: %s\n", okB ? "PASS" : "FAIL");

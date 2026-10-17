@@ -9,3 +9,11 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g -fno-omit-frame-pointer")
 add_executable(bench src/bench.cpp)
 target_include_directories(bench PRIVATE include src)
 target_compile_options(bench PRIVATE -Wall -Wextra)
+
+add_executable(test_orderbook tests/test_orderbook.cpp)
+target_include_directories(test_orderbook PRIVATE include src)
+target_compile_options(test_orderbook PRIVATE -Wall -Wextra)
+
+enable_testing()
+add_test(NAME unit_tests COMMAND test_orderbook)
+add_test(NAME verify COMMAND bench --verify)

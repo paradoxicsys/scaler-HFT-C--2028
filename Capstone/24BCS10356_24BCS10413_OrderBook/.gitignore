@@ -1,4 +1,7 @@
 bench
+bench_san
+test_orderbook
+test_orderbook_san
 bench.dSYM/
 build/
 results/*.data
