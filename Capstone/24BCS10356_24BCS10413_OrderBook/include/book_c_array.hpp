@@ -39,11 +39,13 @@ public:
         table_init(cap);
     }
 
-    // Returns false (and changes nothing) for an out-of-band price, qty <= 0,
-    // or an id that is already live. The band check is what keeps rank()
-    // inside [0, 5000): without it a buy at 120.00 would index qty[-2001].
+    // Returns false (and changes nothing) for an out-of-band, off-tick or
+    // non-finite price, qty <= 0, or an id that is already live. The band
+    // check is what keeps rank() inside [0, 5000): without it a buy at 120.00
+    // would index qty[-2001].
     bool add_order(uint64_t id, Side side, double price, long qty) {
-        return add_order(id, side, to_tick(price), qty);
+        int tick;
+        return price_to_tick(price, tick) && add_order(id, side, tick, qty);
     }
 
     bool add_order(uint64_t id, Side side, int tick, long qty) {

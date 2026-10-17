@@ -295,7 +295,10 @@ static bool edge_cases(const char* name) {
         !book.add_order(13, Side::Sell, 150.01, 5) &&   // above ask band
         !book.add_order(14, Side::Buy, 100.00, 5) &&    // the mid price is in neither band
         !book.add_order(15, Side::Buy, 99.00, 0) &&     // zero quantity
-        !book.add_order(16, Side::Sell, 101.00, -5);    // negative quantity
+        !book.add_order(16, Side::Sell, 101.00, -5) &&  // negative quantity
+        !book.add_order(17, Side::Buy, 42949772.95, 5) &&  // 2^32 + 9999 ticks: used to wrap to 99.99
+        !book.add_order(18, Side::Sell, 100.013, 5) &&  // not a multiple of the 0.01 tick
+        !book.add_order(19, Side::Buy, std::nan(""), 5);  // not a number
     b = book.get_bbo();
     if (!rejected || b.has_bid || b.has_ask || book.cancel_order(10)) {
         std::printf("  [%s] invalid order was accepted\n", name); ok = false;
