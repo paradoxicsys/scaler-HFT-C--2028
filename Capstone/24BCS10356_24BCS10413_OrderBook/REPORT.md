@@ -6,14 +6,15 @@ Design details for A, B and C are in `README.md`; this report covers results and
 
 ## 1. Setup
 
-| | |
-|---|---|
-| Machine | AWS EC2 `c7g.large`: 2 vCPU AWS Graviton3 (Arm Neoverse-V1), L1d 64 KiB/core, L2 1 MiB/core, L3 32 MiB |
-| OS / kernel | Ubuntu 24.04, Linux 7.0.0-1014-aws |
-| Compiler | g++ 13.3.0, `-std=c++17 -O2 -g -fno-omit-frame-pointer` |
-| perf | 7.0.14, `kernel.perf_event_paranoid=1` |
-| Timing | `./bench --impl X`: 5 runs, median (`results/bench_*.txt`) |
-| Counters | `perf stat -r 5 -e … ./bench --impl X --perf` (`results/perf_stat_*.txt`) |
+| | Graviton (`results/`) | Ryzen (`results/x86/`) |
+|---|---|---|
+| Machine | AWS EC2 `c7g.large`: 2 vCPU AWS Graviton3 (Arm Neoverse-V1), L1d 64 KiB/core, L2 1 MiB/core, L3 32 MiB | AMD Ryzen 5 5600H laptop (x86-64, Zen 3): 6 cores, L1d 32 KiB/core, L2 512 KiB/core, L3 16 MiB; `powersave` governor (amd-pstate, balance_performance), on AC power, benchmarks pinned with `taskset -c 3` |
+| OS / kernel | Ubuntu 24.04, Linux 7.0.0-1014-aws | Ubuntu 24.04, Linux 7.0.0-38-generic |
+| Compiler | g++ 13.3.0, `-std=c++17 -O2 -g -fno-omit-frame-pointer` | same |
+| perf | 7.0.14, `kernel.perf_event_paranoid=1` | 7.0.14 installed, but `perf_event_paranoid=4` and no root access: no counters |
+| Code | commit `c6352b0` (before the measurement fixes in §6) | commit `aa7f6f1` (this revision) |
+| Timing | `./bench --impl X`: 5 runs, median (`results/bench_*.txt`) | `./scripts/bench_all.sh results/x86` (5 runs, median) |
+| Counters | `perf stat -r 5 -e … ./bench --impl X --perf` (`results/perf_stat_*.txt`) | unavailable (see §3.2) |
 
 Workload (seed 42): 1,000,000 ops (≈70 % add / 20 % cancel / 10 % `get_bbo`) plus 10,000
 depth queries (`get_bids(10)` + `get_asks(10)` every 100 ops). Full machine details:
@@ -21,14 +22,27 @@ depth queries (`get_bids(10)` + `get_asks(10)` every 100 ops). Full machine deta
 
 ## 2. Correctness
 
-`./bench --verify` feeds the same workload to A, B and C in lock-step and compares, after
-**every** operation, the cancel return value, the BBO, and every level of `get_bids(10)` /
-`get_asks(10)`. It also runs hand-written edge cases (empty book, unknown and double cancel,
-3-level book asked for 10, BBO falling to the next level, zero/negative/huge depth, invalid
-price or quantity). On the EC2 machine: **A PASS, B PASS, C PASS — all implementations produce
-identical results** (`results/verify.txt`). The verify test also passes under UBSan on macOS.
+`./bench --verify` feeds the same workload to A, B, C and a deliberately naive reference model
+(`src/reference_book.hpp`: quantity per tick in a plain array, BBO and depth by scanning it) in
+lock-step. After **every** operation it compares each book with the reference: the add/cancel
+return value, the BBO, and every level of `get_bids(10)` / `get_asks(10)`. It also runs
+hand-written edge cases (empty book, unknown and double cancel, 3-level book asked for 10, BBO
+falling to the next level, zero/negative/huge depth, invalid price or quantity, id 2^64-1).
+**A PASS, B PASS, C PASS: all implementations produce identical results** on both machines
+(`results/verify.txt`, `results/x86/verify.txt`). Checking against a reference rather than
+against A matters: with A deliberately broken (emptied levels never erased), the earlier
+A-as-yardstick harness failed all three books; the current one fails A alone.
+
+`tests/test_orderbook.cpp` adds what the benchmark workload never sends (all 10,000 prices
+through the `double` API, a full 5,000-level side, invalid and wrapping prices, random 64-bit
+ids, duplicate and repeated operations, and C starting from a 16-slot table so `grow()` runs):
+120,132 checks, 0 failures (`results/x86/tests.txt`). Against the original book code it fails
+22 checks: the price and id bugs fixed in §6, items 1–2. Tests and `--verify` are also clean under
+ASan + UBSan (`make sanitize`).
 
 ## 3. Results table
+
+### 3.1 Graviton3, Arm (commit `c6352b0`, with perf counters)
 
 | Metric | A (map + hash) | B (sorted vector + id tree) | C (arrays + bitmap + own hash) |
 |---|---|---|---|
@@ -46,10 +60,16 @@ identical results** (`results/verify.txt`). The verify test also passes under UB
 
 **How to read the table**
 - *Total time* is the uninstrumented pass. It is the most reliable number.
-- *ns / add* and *ns / cancel* time each call with a `steady_clock` pair, minus the measured
-  pair cost (63 ns on this machine). C's operations are cheaper than the timer itself, so its
-  per-op numbers carry a large error. Its total (45 ns per op on average) is the better guide.
-- *ns / BBO* is 1 M back-to-back calls timed as one block. A single call is below timer resolution.
+- *ns / add* and *ns / cancel* time each call with a `steady_clock` pair. **Correction:** this
+  table subtracted 63 ns, the wall time of a timing-loop iteration that contains *two* clock
+  reads; a timed call only carries about one read's worth. These "net" values are therefore too
+  low by roughly one clock read (on the Ryzen that read is 23.5 ns of a 45 ns iteration). The
+  raw values in `results/bench_*.txt` are unaffected. They have not been re-measured on Graviton
+  with the corrected benchmark.
+- *ns / BBO* is 1 M back-to-back calls timed as one block. **Correction:** each result was folded
+  through `fold_bbo()`, whose two `lround()` calls cost ~7.2 ns on the Ryzen against ~2.2 ns for a
+  real `get_bbo()`, so this row mostly measures the checksum. The conclusion (all three tie)
+  holds; see §3.2.
 - *IPC* = instructions ÷ cycles. *Branch misses %* = branch-misses ÷ branches.
 - **Counter availability.** All nine requested events were available. The core has fewer
   hardware counters than events, so perf multiplexed them (each was counted about 28–43 % of the
@@ -60,12 +80,67 @@ identical results** (`results/verify.txt`). The verify test also passes under UB
 - perf counts the whole process, including generating the 1 M-op workload, which is identical
   for all three. `perf record` shows generation and RNG are about 30 % of C's samples and under
   10 % of A's and B's. The differences between columns therefore come from the books.
+  `./bench --gen-only` now measures that shared cost alone for subtraction.
+
+### 3.2 Ryzen 5 5600H, x86-64 (commit `aa7f6f1`, corrected benchmark)
+
+| Metric | A | B | C |
+|---|---|---|---|
+| Total time (ms) | 146.3 | 296.0 | **36.6** |
+| ns / add (net of 23.5 ns timer cost) | 113.9 | 204.1 | **98.0** |
+| ns / cancel (net) | 285.5 | 717.7 | **77.6** |
+| ns / BBO (burst, real `get_bbo`) | 2.22 | 2.22 | 2.22 |
+| ns / depth 10+10 (net) | 140.2 | 127.1 | **123.5** |
+| Page faults: workload generation | 6,900 | 6,900 | 6,900 |
+| Page faults: book construction | 2,064 | 0 | 8,194 |
+| Page faults: timed loop | 5,053 | 9,714 | **0** |
+| IPC, branch misses, cache / L1 / dTLB misses | unavailable | unavailable | unavailable |
+
+Hardware counters were **unavailable** on this machine: `perf stat` fails with
+`perf_event_paranoid=4` and root access was not available to lower it. Page faults come from
+`getrusage` around each phase instead of perf, which also separates construction from the loop.
+The same total-time ranking as on Graviton appears: C 4.0x faster than A and 8.1x faster than B.
+
+### 3.3 Tail latency (Ryzen, raw ns including the ~20 ns timer floor, median of 5 runs)
+
+| | p50 | p90 | p99 | p99.9 |
+|---|---|---|---|---|
+| A add | 131 | 160 | 200 | 1,032 |
+| B add | 171 | 230 | **1,754** | **6,352** |
+| C add | 120 | 141 | 381 | **601** |
+| A cancel | 290 | 461 | 751 | 1,914 |
+| B cancel | 682 | 1,112 | 2,555 | 6,652 |
+| C cancel | 110 | 150 | 400 | **621** |
+| timer only | 20 | 30 | 31 | 31–60 |
+
+`get_bbo` sits at the timer floor for all three (p50 20 ns, p99 31 ns for A and C; B's p99 is
+81 ns). Maxima (4.5–372 µs) are not shown: the "timer only" row alone reaches 9–16 µs, so maxima
+mostly record interrupts rather than the books. `steady_clock` advances in roughly 10 ns
+steps here, which is why percentiles cluster on multiples of 10.
+
+### 3.4 Measurement caveats
+- **Latency vs throughput.** The timed per-call figures are latencies of isolated calls (the
+  clock read stops the CPU overlapping one call with the next). The total is throughput. For A
+  and B the two agree: their mean latencies predict 137 and 285 ns per op against 145 and 293
+  measured. For C they do not: the latencies predict 85 ns per op but the loop averages 36 ns.
+  Our interpretation: C's operations are short (one probe, one array update), so several
+  operations' cache misses on the 32 MB table are in flight at once. A and B each spend a long
+  chain of dependent pointer loads inside one operation, which fills the out-of-order window.
+- **Code layout.** Adding three *unused* members to `OrderBookC` moved its total time by ~1.3 ms
+  (~4 %), and two builds of identical book code differed by ~4 % until both were compiled with
+  `-falign-functions=64 -falign-loops=64 -falign-jumps=64`. Build-to-build differences below
+  ~5 % on C are not meaningful; the 4–8x gaps between designs are far outside that.
+- **Laptop.** The Ryzen runs the `powersave` governor with boost on and could not be switched to
+  `performance` without root. Around the 5-run median, the total varied by -3 to +1 % for C,
+  -4 to +6 % for A and -5 to +10 % for B (B's first run is the outlier;
+  `results/x86/bench_*.txt`). The median is used for that reason.
 
 ## 4. Analysis
 
 ### 4.1 Which is fastest?
-**C is fastest for add and cancel. All three tie on `get_bbo`. B is fastest for depth.**
-C runs the workload 4.5× faster than A and 9.4× faster than B.
+**C is fastest for add and cancel. All three tie on `get_bbo`. B is fastest for depth on
+Graviton.** C runs the workload 4.5× faster than A and 9.4× faster than B on Graviton, and 4.0×
+and 8.1× faster on the Ryzen.
 - **C** adds with one hash probe into a flat table, one array add and one bit-set. It cancels
   with one probe and two stores. Neither touches the allocator.
 - **A** allocates a hash node and descends about 13 red-black-tree nodes per add. perf record
@@ -76,10 +151,15 @@ C runs the workload 4.5× faster than A and 9.4× faster than B.
   `vector::_M_insert_aux`: inserting a new level moves every later `PriceLevel` one slot.
   Each holds its own vector, so this is a move per element, not a single memmove. Another 5.9 %
   is `_Rb_tree_rebalance_for_erase` from the id tree.
-- **`get_bbo`** is O(1) in all three (`map.begin()`, `vector.back()`, cached `best` rank). It
-  costs about 4–5 ns, mostly the checksum fold, so the differences are noise.
-- **Depth:** B wins because its top 10 levels are the last 10 contiguous elements. C computes the
-  next set bit for each level. A follows tree pointers.
+- **`get_bbo`** is O(1) in all three (`map.begin()`, `vector.back()`, cached `best` rank). With
+  the corrected burst it costs 2.22 ns on the Ryzen for all three. In a tight loop the few cache
+  lines involved stay in L1, so all three designs cost the same.
+- **Latency vs throughput:** on the Ryzen, C's add is only 1.2x faster than A's per isolated call
+  (98 vs 114 ns) but 4x faster over the whole run. C's short operations let consecutive misses
+  overlap; A's do not (§3.4).
+- **Depth:** on Graviton B wins because its top 10 levels are the last 10 contiguous elements. C
+  computes the next set bit for each level. A follows tree pointers. On the Ryzen the three are
+  within 15 % of each other (C 124, B 127, A 140 ns net), so this ranking is machine-dependent.
 
 ### 4.2 Branch prediction
 **B has the most branch misses (16.0 M), then A (8.5 M), then C (1.8 M).** A and B have a similar
@@ -121,6 +201,9 @@ identical for all three.
 - **C** takes almost all its faults *at construction*, when it writes the empty marker into each
   of its 2²¹ slots (32 MB = 8,192 pages). After that the hot loop never allocates.
 C's total is similar to A's, but its faults all happen at start-up instead of while trading.
+The Ryzen run measures this directly with `getrusage` (§3.2): C takes 8,194 faults while
+constructing the book and **0** during the timed loop; A takes 2,064 during construction (the
+`reserve(1 << 20)` bucket array) and 5,053 during the loop; B takes 9,714, all during the loop.
 
 ### 4.5 Production choice
 I would deploy **C**.
@@ -128,7 +211,12 @@ I would deploy **C**.
 - **Predictability:** no allocation after start-up, no rebalancing, no reallocation. Its worst
   cases are bounded: a scan of 79 bitmap words when the best level empties, and a probe loop
   capped by the load factor. A and B call the allocator on every add and cancel and rebalance
-  trees, which is where tail-latency spikes come from.
+  trees, which is where tail-latency spikes come from. The Ryzen percentiles bear this out
+  (§3.3): C's p99.9 is ~600 ns for both add and cancel, against ~1–1.9 µs for A and ~6.4–6.7 µs
+  for B. B's add p99 (1.75 µs vs a 171 ns median) points at its occasional expensive adds: a new
+  level shifts every later `PriceLevel` (`_M_insert_aux`, 7.4 % of B's Graviton profile) and a
+  growing per-level order vector reallocates; the Ryzen run did not separate the two. C's own p99 (~380–400 ns, 3x its median) is consistent with a cache
+  and TLB miss on the 32 MB order table.
 - **Memory:** a fixed 80 KB for prices plus 16 B per table slot. It is reserved up front, which
   costs 32 MB even for an empty book. That is a deliberate trade for no runtime allocation.
 - **Cache behaviour:** 3.3–7.6× fewer L1 misses and 7.5–17× fewer dTLB misses than A and B.
@@ -148,6 +236,8 @@ I would deploy **C**.
 7. Time C's operations in batches rather than per call, since the clock costs more than the operation.
 
 ## 5. perf output
+
+Graviton only (§3.1); hardware counters were unavailable on the Ryzen (§3.2).
 
 ### 5.1 `perf stat -r 5` — Implementation A
 ```
@@ -201,3 +291,23 @@ I would deploy **C**.
 | 3.0 % `unordered_map::emplace` | 4.7 % `std::_Rb_tree` (id map) | ≈10 % kernel code (unresolved `[k]` symbols) |
 
 Full reports: `results/perf_report_{A,B,C}.txt`.
+
+## 6. Revision notes (branch `2024bcs10413`)
+
+Defects found by auditing the code against the spec, each with a regression test:
+
+1. **Wrapping and off-tick prices.** `add_order(double)` used `static_cast<int>(lround(price*100))`;
+   the 64-bit result was wrapped into an int, so a buy at 42949772.95 rested at 99.99 in all three
+   books, and 100.013 was rounded to 100.01 despite the 0.01-tick rule. Now `price_to_tick()`
+   rejects both, and NaN/inf.
+2. **C rejected id 2^64-1** (its hash table's empty marker) while A and B accepted it. It now
+   lives in a spare slot past the probed range.
+3. **Benchmark timer cost** was subtracted twice over (loop-iteration wall time instead of one
+   timed interval), and the **`get_bbo` burst** mostly timed `lround()` in the checksum fold.
+4. **`--verify` used A as the yardstick**, so a bug in A would show up as B and C failing. It now
+   checks every book against an independent reference model.
+
+Added: tail-latency percentiles, per-phase page faults, `--gen-only`, strict CLI parsing,
+`tests/test_orderbook.cpp`, `make test` / `make sanitize` / CTest, `scripts/bench_all.sh`, and
+the Ryzen results in `results/x86/`. Not yet done: re-running the benchmark and `perf` on
+Graviton with the corrected benchmark, and perf counters on the Ryzen.

@@ -9,7 +9,8 @@
 
 Three genuinely different single-instrument resting order books behind the same
 interface, one benchmark program that selects the implementation on the command
-line, a lock-step correctness test (`--verify`), and a perf-based analysis
+line, a lock-step correctness test (`--verify`) against an independent reference
+model, a regression/differential test program, and a perf-based analysis
 (`REPORT.md`).
 
 ```
@@ -18,9 +19,13 @@ include/book_a_map.hpp          Implementation A : std::map levels + std::unorde
 include/book_b_vector.hpp       Implementation B : sorted std::vector of levels, orders stored in the level, std::map id lookup
 include/book_c_array.hpp        Implementation C : price-indexed arrays + bitmap + custom open-addressing hash
 src/workload.hpp                deterministic workload generator (mt19937(42))
-src/bench.cpp                   benchmark + --verify + --perf
+src/reference_book.hpp          naive reference model (tick array + linear scan) used as the test oracle
+src/bench.cpp                   benchmark + --verify + --perf + --gen-only
+tests/test_orderbook.cpp        regression + randomized differential tests against the reference model
 scripts/perf_all.sh             runs perf stat / perf record for A, B, C (Linux)
-results/                        Linux (EC2 c7g.large) verify, bench and perf outputs; results/macos/ has Mac runs
+scripts/bench_all.sh            runs tests, --verify and the A/B/C benchmarks, saves outputs
+results/                        Linux (EC2 c7g.large, Arm) verify, bench and perf outputs; results/macos/ has Mac runs
+results/x86/                    AMD Ryzen 5 5600H (x86-64) tests, verify and bench outputs from the current code
 REPORT.md                       results table + performance analysis
 ```
 
@@ -36,8 +41,11 @@ or simply
 
 ```sh
 make            # same command as above
+make test       # builds test_orderbook too, runs it, then ./bench --verify
+make sanitize   # the tests + a 200k-op --verify under AddressSanitizer + UBSan
 # or
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build   # produces build/bench
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build   # build/bench, build/test_orderbook
+(cd build && ctest)                                                 # unit tests + --verify
 ```
 
 `-g` and `-fno-omit-frame-pointer` only add symbols / keep frame pointers so
@@ -54,22 +62,30 @@ No external libraries; the standard library only.
 The test (1) runs hand-written edge cases on every implementation (empty-book
 BBO, cancel of an unknown id, double cancel, `get_bids(10)` on a 3-level book,
 BBO moving to the next level when the best level empties, re-using an emptied
-level, zero / negative / huge depth requests, rejection of out-of-band prices,
-qty <= 0 and duplicate ids) and (2) feeds the identical random workload to A, B
-and C in lock-step,
-comparing after **every** operation the `cancel_order` return value, the BBO,
-`get_bids(10)` and `get_asks(10)` (price and quantity of every level). It also
-checks that the benchmark path produces the same checksum for all three.
+level, zero / negative / huge depth requests, rejection of out-of-band,
+off-tick, wrapping and NaN prices, qty <= 0, duplicate ids, and the largest
+id 2^64-1) and (2) feeds the identical random workload to A, B and C in
+lock-step with `ReferenceBook` (`src/reference_book.hpp`), a deliberately
+naive model that keeps the quantity per tick in a plain array and finds the
+BBO and depth by scanning it. After **every** operation it compares each book
+with the reference: the `add_order`/`cancel_order` return value, the BBO,
+`get_bids(10)` and `get_asks(10)` (price and quantity of every level). Because
+each book is checked against the reference rather than against A, a bug in A
+fails A alone. It also checks that the benchmark path produces the same
+checksum for the reference and all three books.
 
-Captured output (`results/verify.txt`):
+Captured output on Linux (`results/x86/verify.txt`; the checksum matches the
+Graviton run in `results/verify.txt` because both use libstdc++):
 
 ```
 Running correctness test...
 
 Edge cases (empty book, unknown/double cancel, insufficient depth, invalid input):
   A: PASS   B: PASS   C: PASS
-Lock-step workload comparison (1010000 ops, BBO + 10-level depth compared after every op):
-Benchmark checksums: A=6207609776843994971 B=6207609776843994971 C=6207609776843994971
+Lock-step workload comparison against an independent reference model (1010000 ops;
+add/cancel result, BBO and 10-level bid/ask depth compared after every op):
+  mismatching ops: A 0, B 0, C 0
+Benchmark checksums: reference=9406903409647291425 A=9406903409647291425 B=9406903409647291425 C=9406903409647291425
 
 Implementation A: PASS
 Implementation B: PASS
@@ -77,6 +93,25 @@ Implementation C: PASS
 
 All implementations produce identical results.
 ```
+
+### Regression and differential tests
+
+```sh
+make test               # or: ./test_orderbook
+```
+
+`tests/test_orderbook.cpp` covers inputs the benchmark workload never produces:
+all 10,000 valid prices through the `double` API (as `tick / 100.0` and parsed
+with `strtod`), a full 5,000-level side, wrapping / off-tick / NaN / infinite /
+wrong-band prices, draining a full book in random order (the best level keeps
+moving, so C scans its bitmap across word boundaries), and 3 x 200,000 random
+operations with random 64-bit ids (including 0 and 2^64-1), duplicate adds,
+cancels of unknown and already-cancelled ids, re-use of a cancelled id and
+invalid quantities, each compared with the reference model. It also runs C
+starting from a 16-slot hash table so that `grow()` and wrap-around
+backward-shift deletion execute (`--verify`'s 2^21-slot table never grows).
+Output (`results/x86/tests.txt`): `120132 checks, 0 failures`. `make sanitize`
+runs the tests and a 200k-op `--verify` under ASan + UBSan; both are clean.
 
 ## Run the benchmarks
 
@@ -111,13 +146,31 @@ Each run does two passes over the same op stream:
 1. **uninstrumented** — one `steady_clock` read before and after the loop →
    *Total time*;
 2. **instrumented** — a `steady_clock` pair around every single call →
-   ns / add, ns / cancel, ns / bbo, ns / depth. The measured cost of a clock
-   pair (≈63 ns on the Graviton3 test machine, ≈25 ns on an Apple M3) is printed and a "net" column subtracts it.
+   mean ns / add, ns / cancel, ns / bbo, ns / depth, plus p50 / p90 / p99 /
+   p99.9 / max latency per operation type (median over the runs). The cost a
+   clock pair adds to every sample (the mean *empty* timed interval, ≈23 ns on
+   the Ryzen) is measured the same way and printed; the "net" column subtracts
+   it, and a "timer only" row in the percentile table shows the floor.
    Because a `get_bbo` is far cheaper than a clock read, a third number is
-   reported: 1,000,000 back-to-back `get_bbo()` calls timed as a block.
+   reported: 1,000,000 back-to-back `get_bbo()` calls timed as a block, behind
+   a compiler barrier so each iteration really calls `get_bbo()`.
+
+Page faults are read with `getrusage` around each phase and reported as
+workload generation / book construction / timed loop (run 1).
 
 The final BBO and a checksum (folded from every BBO/depth result and every
 cancel return value) are printed so the compiler cannot discard the work.
+
+`./scripts/bench_all.sh results/<name>` runs the tests, `--verify` and all three
+benchmarks and saves the outputs with a machine summary
+(`PIN="taskset -c 3"` pins the benchmarks to one core).
+
+**Measurement fixes in this revision** (the Graviton files in `results/`
+predate them; `REPORT.md` §3 explains the effect): an earlier version
+subtracted the wall time of a whole timing-loop iteration (two clock reads)
+instead of one timed interval, so its "net" figures were about one clock read
+too low; and its `get_bbo` burst folded each result through `lround()`, which
+cost ~3x more than `get_bbo` itself.
 
 For `perf`, use `--perf`: one uninstrumented pass, no timers, no bbo burst, so
 the counters are dominated by the book itself:
@@ -126,7 +179,12 @@ the counters are dominated by the book itself:
 perf stat -r 5 -e task-clock,cycles,instructions,branches,branch-misses,cache-misses,L1-dcache-load-misses,dTLB-load-misses,page-faults ./bench --impl A --perf
 perf record -g ./bench --impl A --perf && perf report
 ./scripts/perf_all.sh      # all of the above for A, B and C -> results/perf_*.txt
+perf stat -r 5 -e ... ./bench --gen-only   # baseline: workload generation alone
 ```
+
+perf counts the whole process, including generating the workload. Running the
+same `perf stat` on `./bench --gen-only` measures that shared cost alone, so it
+can be subtracted from each implementation's counters.
 
 ## Interface changes
 
@@ -147,6 +205,17 @@ The required API is kept, with these additions / notes:
   50.00–99.99, asks 100.01–150.00), when `qty <= 0` or `qty > INT32_MAX`, or
   when the id is already live. This keeps C's price arrays from being indexed
   out of bounds and keeps all three books in agreement on bad input.
+* `add_order(..., double price, ...)` converts with `price_to_tick()`, which
+  also rejects prices that are not a multiple of 0.01 (more than 1e-8 away
+  from a tick, e.g. `100.013`), NaN / infinity, and values far outside the int
+  range. Previously `static_cast<int>(lround(price * 100))` silently rounded
+  off-tick prices and wrapped huge ones: a buy at `42949772.95`
+  (2^32 + 9999 ticks) was accepted at 99.99. All 10,000 valid prices still
+  convert exactly, including ones parsed from text or accumulated by repeated
+  `+= 0.01`.
+* Every `uint64_t` id is accepted, including 2^64-1, which C stores in a spare
+  slot because it doubles as its hash table's empty marker (previously C
+  rejected it while A and B accepted it).
 * Implementation C stores the quantity of an order as `int32_t` inside its
   16-byte hash slot (quantities are 1–100 here); level totals are `long`.
 
@@ -196,3 +265,5 @@ for i in A B C; do ./bench --impl $i | tee results/bench_$i.txt; done
 
 If `perf` reports permission errors, run `sudo sysctl kernel.perf_event_paranoid=1` (or ask the
 lab admin). Events shown as `<not supported>` should be listed as unavailable in REPORT.md.
+(On the Ryzen laptop used for `results/x86/`, `perf_event_paranoid` is 4 and root was not
+available, so no hardware counters were collected there; see REPORT.md §3.)
