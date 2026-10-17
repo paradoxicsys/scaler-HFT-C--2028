@@ -12,7 +12,7 @@ Design details for A, B and C are in `README.md`; this report covers results and
 | OS / kernel | Ubuntu 24.04, Linux 7.0.0-1014-aws | Ubuntu 24.04, Linux 7.0.0-38-generic |
 | Compiler | g++ 13.3.0, `-std=c++17 -O2 -g -fno-omit-frame-pointer` | same |
 | perf | 7.0.14, `kernel.perf_event_paranoid=1` | 7.0.14 installed, but `perf_event_paranoid=4` and no root access: no counters |
-| Code | commit `c6352b0` (before the measurement fixes in §6) | commit `aa7f6f1` (this revision) |
+| Code | commit `c6352b0` (before the measurement fixes in §6) | commit `13f571c` (final code of this revision) |
 | Timing | `./bench --impl X`: 5 runs, median (`results/bench_*.txt`) | `./scripts/bench_all.sh results/x86` (5 runs, median) |
 | Counters | `perf stat -r 5 -e … ./bench --impl X --perf` (`results/perf_stat_*.txt`) | unavailable (see §3.2) |
 
@@ -37,8 +37,8 @@ A-as-yardstick harness failed all three books; the current one fails A alone.
 `tests/test_orderbook.cpp` adds what the benchmark workload never sends (all 10,000 prices
 through the `double` API, a full 5,000-level side, invalid and wrapping prices, random 64-bit
 ids, duplicate and repeated operations, and C starting from a 16-slot table so `grow()` runs):
-120,132 checks, 0 failures (`results/x86/tests.txt`). Against the original book code it fails
-22 checks: the price and id bugs fixed in §6, items 1–2. Tests and `--verify` are also clean under
+120,156 checks, 0 failures (`results/x86/tests.txt`). When these tests were added they failed 22
+checks against the original book code: the price and id bugs fixed in §6, items 1–2. Tests and `--verify` are also clean under
 ASan + UBSan (`make sanitize`).
 
 ## 3. Results table
@@ -83,16 +83,16 @@ ASan + UBSan (`make sanitize`).
   10 % of A's and B's. The differences between columns therefore come from the books.
   `./bench --gen-only` now measures that shared cost alone for subtraction.
 
-### 3.2 Ryzen 5 5600H, x86-64 (commit `aa7f6f1`, corrected benchmark)
+### 3.2 Ryzen 5 5600H, x86-64 (commit `13f571c`, corrected benchmark)
 
 | Metric | A | B | C |
 |---|---|---|---|
-| Total time (ms) | 146.3 | 296.0 | **36.6** |
-| ns / add (net of 23.5 ns timer cost) | 113.9 | 204.1 | **98.0** |
-| ns / cancel (net) | 285.5 | 717.7 | **77.6** |
-| ns / BBO (burst, real `get_bbo`) | 2.22 | 2.22 | 2.22 |
-| ns / depth 10+10 (net) | 140.2 | 127.1 | **123.5** |
-| Page faults: workload generation | 6,900 | 6,900 | 6,900 |
+| Total time (ms) | 149.5 | 304.0 | **36.6** |
+| ns / add (net of the 23.7–24.5 ns timer cost) | 114.5 | 201.5 | **98.5** |
+| ns / cancel (net) | 312.6 | 743.7 | **78.7** |
+| ns / BBO (burst, real `get_bbo`) | 2.26 | 2.20 | 2.21 |
+| ns / depth 10+10 (net) | 139.5 | 127.0 | **123.4** |
+| Page faults: workload generation | 6,900 | 6,900 | 6,899 |
 | Page faults: book construction | 2,064 | 0 | 8,194 |
 | Page faults: timed loop | 5,053 | 9,714 | **0** |
 | IPC, branch misses, cache / L1 / dTLB misses | unavailable | unavailable | unavailable |
@@ -100,48 +100,51 @@ ASan + UBSan (`make sanitize`).
 Hardware counters were **unavailable** on this machine: `perf stat` fails with
 `perf_event_paranoid=4` and root access was not available to lower it. Page faults come from
 `getrusage` around each phase instead of perf, which also separates construction from the loop.
-The same total-time ranking as on Graviton appears: C 4.0x faster than A and 8.1x faster than B.
+The same total-time ranking as on Graviton appears: C 4.1x faster than A and 8.3x faster than B.
 
 ### 3.3 Tail latency (Ryzen, raw ns including the ~20 ns timer floor, median of 5 runs)
 
 | | p50 | p90 | p99 | p99.9 |
 |---|---|---|---|---|
-| A add | 131 | 160 | 200 | 1,032 |
-| B add | 171 | 230 | **1,754** | **6,352** |
-| C add | 120 | 141 | 381 | **601** |
-| A cancel | 290 | 461 | 751 | 1,914 |
-| B cancel | 682 | 1,112 | 2,555 | 6,652 |
-| C cancel | 110 | 150 | 400 | **621** |
-| timer only | 20 | 30 | 31 | 31–60 |
+| A add | 131 | 161 | 220 | 881 |
+| B add | 170 | 230 | **1,773** | **6,373** |
+| C add | 120 | 141 | 381 | **611** |
+| A cancel | 321 | 491 | 771 | 1,904 |
+| B cancel | 711 | 1,152 | 2,635 | 6,702 |
+| C cancel | 110 | 141 | 401 | **591** |
+| timer only | 20 | 30 | 31–60 | 31–70 |
 
 `get_bbo` sits at the timer floor for all three (p50 20 ns, p99 31 ns for A and C; B's p99 is
-81 ns). Maxima (4.5–372 µs) are not shown: the "timer only" row alone reaches 9–16 µs, so maxima
+90 ns). Maxima (4.7–261 µs) are not shown: the "timer only" row alone reaches 7–12 µs, so maxima
 mostly record interrupts rather than the books. `steady_clock` advances in roughly 10 ns
 steps here, which is why percentiles cluster on multiples of 10.
 
 ### 3.4 Measurement caveats
 - **Latency vs throughput.** The timed per-call figures are latencies of isolated calls (the
   clock read stops the CPU overlapping one call with the next). The total is throughput. For A
-  and B the two agree: their mean latencies predict 137 and 285 ns per op against 145 and 293
-  measured. For C they do not: the latencies predict 85 ns per op but the loop averages 36 ns.
+  and B the two roughly agree: their mean latencies predict 143 and 288 ns per op against 148 and
+  301 measured. For C they do not: the latencies predict 85 ns per op but the loop averages 36 ns.
   Our interpretation: C's operations are short (one probe, one array update), so several
   operations' cache misses on the 32 MB table are in flight at once. A and B each spend a long
   chain of dependent pointer loads inside one operation, which fills the out-of-order window.
 - **Code layout.** Adding three *unused* members to `OrderBookC` moved its total time by ~1.3 ms
-  (~4 %), and two builds of identical book code differed by ~4 % until both were compiled with
-  `-falign-functions=64 -falign-loops=64 -falign-jumps=64`. Build-to-build differences below
+  (~4 %), and C before and after the id fix in §6 (which only adds a rarely taken path) measured
+  ~4 % apart until both were compiled with `-falign-functions=64 -falign-loops=64
+  -falign-jumps=64`, after which they matched. Build-to-build differences below
   ~5 % on C are not meaningful; the 4–8x gaps between designs are far outside that.
 - **Laptop.** The Ryzen runs the `powersave` governor with boost on and could not be switched to
-  `performance` without root. Around the 5-run median, the total varied by -3 to +1 % for C,
-  -4 to +6 % for A and -5 to +10 % for B (B's first run is the outlier;
-  `results/x86/bench_*.txt`). The median is used for that reason.
+  `performance` without root. Around the 5-run median, the total varied by -4 to +4 % for C,
+  -4 to +14 % for A and -5 to +18 % for B. The high end is each process's first run, which in
+  both captures was the slowest for A and B, probably because it is the only run that touches
+  fresh heap pages; later runs reuse memory the previous book freed (`results/x86/bench_*.txt`).
+  The median is used for that reason.
 
 ## 4. Analysis
 
 ### 4.1 Which is fastest?
 **C is fastest for add and cancel. All three tie on `get_bbo`. B is fastest for depth on
-Graviton.** C runs the workload 4.5× faster than A and 9.4× faster than B on Graviton, and 4.0×
-and 8.1× faster on the Ryzen.
+Graviton.** C runs the workload 4.5× faster than A and 9.4× faster than B on Graviton, and 4.1×
+and 8.3× faster on the Ryzen.
 - **C** adds with one hash probe into a flat table, one array add and one bit-set. It cancels
   with one probe and two stores. Neither touches the allocator.
 - **A** allocates a hash node and descends about 13 red-black-tree nodes per add. perf record
@@ -154,14 +157,14 @@ and 8.1× faster on the Ryzen.
   Each holds its own vector, so this is a move per element, not a single memmove. Another 5.9 %
   is `_Rb_tree_rebalance_for_erase` from the id tree.
 - **`get_bbo`** is O(1) in all three (`map.begin()`, `vector.back()`, cached `best` rank). With
-  the corrected burst it costs 2.22 ns on the Ryzen for all three. In a tight loop the few cache
+  the corrected burst it costs 2.20–2.26 ns on the Ryzen for all three. In a tight loop the few cache
   lines involved stay in L1, so all three designs cost the same.
 - **Latency vs throughput:** on the Ryzen, C's add is only 1.2x faster than A's per isolated call
-  (98 vs 114 ns) but 4x faster over the whole run. C's short operations let consecutive misses
+  (98.5 vs 114.5 ns) but 4.1x faster over the whole run. C's short operations let consecutive misses
   overlap; A's do not (§3.4).
 - **Depth:** on Graviton B wins because its top 10 levels are the last 10 contiguous elements. C
   computes the next set bit for each level. A follows tree pointers. On the Ryzen the three are
-  within 15 % of each other (C 124, B 127, A 140 ns net), so this ranking is machine-dependent.
+  within 15 % of each other (C 123, B 127, A 140 ns net), so this ranking is machine-dependent.
 
 ### 4.2 Branch prediction
 **B has the most branch misses (16.0 M), then A (8.5 M), then C (1.8 M).** A and B have a similar
@@ -218,8 +221,8 @@ I would deploy **C**.
   bitmap words when the best level empties, and a probe loop whose expected length the load
   factor keeps short. A and B call the allocator on every add and cancel and rebalance
   trees, which is where tail-latency spikes come from. The Ryzen percentiles bear this out
-  (§3.3): C's p99.9 is ~600 ns for both add and cancel, against ~1–1.9 µs for A and ~6.4–6.7 µs
-  for B. B's add p99 (1.75 µs vs a 171 ns median) points at its occasional expensive adds: a new
+  (§3.3): C's p99.9 is ~600 ns for both add and cancel, against ~0.9–1.9 µs for A and ~6.4–6.7 µs
+  for B. B's add p99 (1.77 µs vs a 170 ns median) points at its occasional expensive adds: a new
   level shifts every later `PriceLevel` (`_M_insert_aux`, 7.4 % of B's Graviton profile) and a
   growing per-level order vector reallocates; the Ryzen run did not separate the two. C's own p99 (~380–400 ns, 3x its median) is consistent with a cache
   and TLB miss on the 32 MB order table.

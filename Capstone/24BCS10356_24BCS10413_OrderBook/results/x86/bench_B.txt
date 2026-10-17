@@ -1,26 +1,26 @@
 Implementation B  (1000000 ops: 700471 add, 199303 cancel, 100226 bbo, +10000 depth queries; 5 runs)
-  run 1: total 325.97 ms | add 228.6 ns | cancel 751.3 ns | bbo 28.2 ns | depth(10+10) 148.6 ns | bbo burst 2.26 ns
-  run 2: total 284.65 ms | add 226.9 ns | cancel 726.7 ns | bbo 28.2 ns | depth(10+10) 149.5 ns | bbo burst 2.22 ns
-  run 3: total 295.99 ms | add 229.5 ns | cancel 783.4 ns | bbo 29.6 ns | depth(10+10) 153.6 ns | bbo burst 2.22 ns
-  run 4: total 303.28 ms | add 224.9 ns | cancel 741.2 ns | bbo 27.9 ns | depth(10+10) 150.6 ns | bbo burst 2.22 ns
-  run 5: total 282.20 ms | add 227.6 ns | cancel 728.7 ns | bbo 28.3 ns | depth(10+10) 151.3 ns | bbo burst 2.22 ns
+  run 1: total 358.49 ms | add 229.3 ns | cancel 777.9 ns | bbo 29.0 ns | depth(10+10) 151.6 ns | bbo burst 2.21 ns
+  run 2: total 291.37 ms | add 225.7 ns | cancel 748.5 ns | bbo 27.6 ns | depth(10+10) 151.8 ns | bbo burst 2.20 ns
+  run 3: total 306.16 ms | add 226.1 ns | cancel 768.2 ns | bbo 28.6 ns | depth(10+10) 150.2 ns | bbo burst 2.19 ns
+  run 4: total 290.45 ms | add 225.4 ns | cancel 788.7 ns | bbo 29.5 ns | depth(10+10) 152.7 ns | bbo burst 2.20 ns
+  run 5: total 304.04 ms | add 226.7 ns | cancel 764.1 ns | bbo 28.6 ns | depth(10+10) 151.2 ns | bbo burst 2.20 ns
 
 Median of 5 runs (impl B):          raw   net of timer cost
-  Total time        :     295.99 ms   (uninstrumented pass, 1010000 ops)
-  ns / add_order    :      227.6        204.1
-  ns / cancel_order :      741.2        717.7
-  ns / get_bbo      :       28.2          4.7   (per-call timing; near timer resolution)
-  ns / get_bbo burst:       2.22              (1M back-to-back calls on final book, timed as a block)
-  ns / depth query  :      150.6        127.1   (get_bids(10) + get_asks(10))
-  timer cost        :       23.5 ns   (mean empty timed interval; subtracted for "net")
+  Total time        :     304.04 ms   (uninstrumented pass, 1010000 ops)
+  ns / add_order    :      226.1        201.5
+  ns / cancel_order :      768.2        743.7
+  ns / get_bbo      :       28.6          4.1   (per-call timing; near timer resolution)
+  ns / get_bbo burst:       2.20              (1M back-to-back calls on final book, timed as a block)
+  ns / depth query  :      151.6        127.0   (get_bids(10) + get_asks(10))
+  timer cost        :       24.5 ns   (mean empty timed interval; subtracted for "net")
 
 Per-call latency percentiles, ns (raw, timer cost included; median of 5 runs):
                       p50      p90      p99    p99.9        max
-  add_order           171      230     1754     6352     372445
-  cancel_order        682     1112     2555     6652      24496
-  get_bbo              21       30       81      341       6042
-  depth (10+10)       140      170      231      711       5180
-  timer only           20       30       31       31      15990
+  add_order           170      230     1773     6373     261426
+  cancel_order        711     1152     2635     6702      21410
+  get_bbo              20       30       90      341       5220
+  depth (10+10)       141      170      230      691       5611
+  timer only           20       30       60       70       8536
 
 Page faults (run 1): workload generation 6900 | book construction 0 | timed loop 9714
 

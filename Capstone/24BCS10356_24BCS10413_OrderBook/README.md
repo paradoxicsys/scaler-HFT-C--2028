@@ -105,15 +105,15 @@ make test               # or: ./test_orderbook
 
 `tests/test_orderbook.cpp` covers inputs the benchmark workload never produces:
 all 10,000 valid prices through the `double` API (as `tick / 100.0` and parsed
-with `strtod`), a full 5,000-level side, wrapping / off-tick / NaN / infinite /
-wrong-band prices, draining a full book in random order (the best level keeps
+with `strtod`), whole-number prices passed as `int` / `long` / `unsigned`, a full
+5,000-level side, wrapping / off-tick / NaN / infinite / wrong-band prices, draining a full book in random order (the best level keeps
 moving, so C scans its bitmap across word boundaries), and 3 x 200,000 random
 operations with random 64-bit ids (including 0 and 2^64-1), duplicate adds,
 cancels of unknown and already-cancelled ids, re-use of a cancelled id and
 invalid quantities, each compared with the reference model. It also runs C
 starting from a 16-slot hash table so that `grow()` and wrap-around
 backward-shift deletion execute (`--verify`'s 2^21-slot table never grows).
-Output (`results/x86/tests.txt`): `120132 checks, 0 failures`. `make sanitize`
+Output (`results/x86/tests.txt`): `120156 checks, 0 failures`. `make sanitize`
 runs the tests and a 200k-op `--verify` under ASan + UBSan; both are clean.
 
 ## Run the benchmarks
@@ -152,7 +152,7 @@ Each run does two passes over the same op stream:
 2. **instrumented** — a `steady_clock` pair around every single call →
    mean ns / add, ns / cancel, ns / bbo, ns / depth, plus p50 / p90 / p99 /
    p99.9 / max latency per operation type (median over the runs). The cost a
-   clock pair adds to every sample (the mean *empty* timed interval, ≈23 ns on
+   clock pair adds to every sample (the mean *empty* timed interval, ≈24 ns on
    the Ryzen) is measured the same way and printed; the "net" column subtracts
    it, and a "timer only" row in the percentile table shows the floor.
    Because a `get_bbo` is far cheaper than a clock read, a third number is
