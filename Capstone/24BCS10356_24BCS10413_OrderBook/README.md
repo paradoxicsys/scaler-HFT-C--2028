@@ -35,6 +35,7 @@ Single compiler command (C++17, `-O2`):
 
 ```sh
 g++ -std=c++17 -O2 -Wall -Wextra -g -fno-omit-frame-pointer -Iinclude -Isrc src/bench.cpp -o bench
+g++ -std=c++17 -O2 -Wall -Wextra -Iinclude -Isrc tests/test_orderbook.cpp -o test_orderbook   # tests
 ```
 
 or simply
@@ -178,13 +179,14 @@ the counters are dominated by the book itself:
 ```sh
 perf stat -r 5 -e task-clock,cycles,instructions,branches,branch-misses,cache-misses,L1-dcache-load-misses,dTLB-load-misses,page-faults ./bench --impl A --perf
 perf record -g ./bench --impl A --perf && perf report
-./scripts/perf_all.sh      # all of the above for A, B and C -> results/perf_*.txt
+./scripts/perf_all.sh      # all of the above for A, B and C, plus the --gen-only baseline
 perf stat -r 5 -e ... ./bench --gen-only   # baseline: workload generation alone
 ```
 
 perf counts the whole process, including generating the workload. Running the
 same `perf stat` on `./bench --gen-only` measures that shared cost alone, so it
-can be subtracted from each implementation's counters.
+can be subtracted from each implementation's counters; `perf_all.sh` saves it
+as `perf_stat_gen.txt`.
 
 ## Interface changes
 
@@ -260,8 +262,12 @@ allocated and filled once at construction, so the hot path never allocates.
 make
 ./bench --verify
 for i in A B C; do ./bench --impl $i | tee results/bench_$i.txt; done
-./scripts/perf_all.sh       # writes results/perf_stat_{A,B,C}.txt and results/perf_report_{A,B,C}.txt
+./scripts/perf_all.sh       # writes results/perf_stat_{A,B,C,gen}.txt and results/perf_report_{A,B,C}.txt
+./scripts/perf_all.sh results/x86   # same, into another directory (keeps the Graviton files intact)
 ```
+
+`perf_all.sh` checks first that perf can open events and, if not, prints the
+`perf_event_paranoid` fix instead of failing five times.
 
 If `perf` reports permission errors, run `sudo sysctl kernel.perf_event_paranoid=1` (or ask the
 lab admin). Events shown as `<not supported>` should be listed as unavailable in REPORT.md.
