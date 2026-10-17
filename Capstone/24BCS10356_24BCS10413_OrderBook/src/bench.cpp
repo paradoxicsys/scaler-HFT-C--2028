@@ -306,6 +306,15 @@ static bool edge_cases(const char* name) {
     if (!book.add_order(20, Side::Buy, 99.00, 1) || book.add_order(20, Side::Buy, 98.00, 1)) {
         std::printf("  [%s] duplicate id handling wrong\n", name); ok = false;
     }
+    // the largest uint64_t id is a legal id (C stores it outside its hash table)
+    const uint64_t max_id = ~0ull;
+    const bool max_added = book.add_order(max_id, Side::Sell, 150.00, 2);
+    const std::vector<Level> top_ask = book.get_asks(1);
+    if (!max_added || book.add_order(max_id, Side::Sell, 149.00, 2) || top_ask.size() != 1 ||
+        to_tick(top_ask[0].price) != 15000 || top_ask[0].qty != 2 || !book.cancel_order(max_id) ||
+        book.cancel_order(max_id) || book.get_bbo().has_ask) {
+        std::printf("  [%s] id 2^64-1 handling wrong\n", name); ok = false;
+    }
     return ok;
 }
 
