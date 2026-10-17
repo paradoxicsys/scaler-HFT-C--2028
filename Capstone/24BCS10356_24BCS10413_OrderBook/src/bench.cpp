@@ -2,22 +2,27 @@
 //
 //   ./bench --impl A|B|C [--runs 5] [--ops 1000000] [--seed 42]
 //   ./bench --impl A|B|C --perf          (one uninstrumented pass only; for perf stat/record)
+//   ./bench --gen-only   [--ops N] [--seed S]   (workload generation only; perf baseline)
 //   ./bench --verify     [--ops 1000000] [--seed 42]
 //
 // Timing uses std::chrono::steady_clock. Each run performs two passes over the
 // identical pre-generated workload:
 //   1. an *uninstrumented* pass (one timer around the whole loop) -> total time
-//   2. an *instrumented* pass (timer around every call) -> ns per op type
-// so the per-op numbers do not pollute the total-time figure. The measured
-// cost of a steady_clock::now() pair is printed so it can be subtracted from
-// the per-op averages if desired.
+//   2. an *instrumented* pass (timer around every call) -> mean ns per op type
+//      and latency percentiles
+// so the per-op numbers do not pollute the total-time figure. The cost a timer
+// pair adds to every sample (an empty timed interval) is measured and printed,
+// and the "net" means subtract it.
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <sys/resource.h>
 
 #include "book_a_map.hpp"
 #include "book_b_vector.hpp"
@@ -30,6 +35,22 @@ static inline uint64_t now_ns() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
 }
+
+// Page faults (minor + major) taken by this process so far. Sampling it around
+// each phase splits faults into workload generation, book construction and the
+// hot loop, which a whole-process perf stat count cannot do.
+static long page_faults() {
+    rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+    return ru.ru_minflt + ru.ru_majflt;
+}
+
+// Compiler barriers for the get_bbo burst (same idea as Google Benchmark's
+// DoNotOptimize/ClobberMemory). escape() makes the book's address visible to
+// an opaque asm statement and the "memory" clobber says that statement may
+// have written to it, so get_bbo() has to be re-run every iteration instead of
+// being hoisted out of the loop as loop-invariant.
+static inline void escape(const void* p) { asm volatile("" : : "g"(p) : "memory"); }
 
 // ----------------------------------------------------------------------------
 // Checksum helpers (keep the compiler honest and give --verify something to compare)
@@ -49,13 +70,49 @@ static inline uint64_t fold_levels(uint64_t h, const std::vector<Level>& v) {
     return h;
 }
 
+// Cheap fold for the get_bbo burst. fold_bbo() calls lround() twice through
+// to_tick(), and on its own costs ~3x more than get_bbo(), so a burst built on
+// it mostly timed the checksum. This one folds the raw price bits instead.
+static inline uint64_t bits_of(double d) {
+    uint64_t u;
+    std::memcpy(&u, &d, sizeof u);
+    return u;
+}
+static inline uint64_t fold_bbo_raw(uint64_t h, const BBO& b) {
+    return h + (bits_of(b.bid_price) ^ static_cast<uint64_t>(b.bid_qty) ^ b.has_bid) +
+           (bits_of(b.ask_price) ^ static_cast<uint64_t>(b.ask_qty) ^ b.has_ask);
+}
+
 // ----------------------------------------------------------------------------
 // Benchmark
 // ----------------------------------------------------------------------------
+struct Pct {
+    double p50 = 0, p90 = 0, p99 = 0, p999 = 0, max = 0;
+};
+
+// Latency percentiles of per-call samples in ns (nearest-rank). Sorts `v`.
+static Pct percentiles(std::vector<uint32_t>& v) {
+    Pct p;
+    if (v.empty()) return p;
+    std::sort(v.begin(), v.end());
+    auto at = [&](double q) { return static_cast<double>(v[static_cast<size_t>(q * (v.size() - 1))]); };
+    p.p50 = at(0.50);
+    p.p90 = at(0.90);
+    p.p99 = at(0.99);
+    p.p999 = at(0.999);
+    p.max = v.back();
+    return p;
+}
+
+static inline uint32_t sample(uint64_t ns) { return ns > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(ns); }
+
 struct RunResult {
     double total_ms = 0;        // uninstrumented pass
-    double ns_add = 0, ns_cancel = 0, ns_bbo = 0, ns_depth = 0;  // instrumented pass
+    double ns_add = 0, ns_cancel = 0, ns_bbo = 0, ns_depth = 0;  // instrumented pass, means
+    Pct p_add, p_cancel, p_bbo, p_depth;                          // instrumented pass, percentiles
     double ns_bbo_burst = 0;    // 1M back-to-back get_bbo() calls, timed as a block
+    long faults_construct = 0;  // page faults while constructing the book (pass 1)
+    long faults_loop = 0;       // page faults during the timed loop (pass 1)
     uint64_t checksum = 0;
     BBO final_bbo{};
 };
@@ -66,7 +123,9 @@ static RunResult run_once(const Workload& w) {
 
     // ---- pass 1: whole-loop timing ------------------------------------
     {
+        const long f0 = page_faults();
         Book book;
+        const long f1 = page_faults();
         uint64_t chk = 0;
         const uint64_t t0 = now_ns();
         for (const Op& op : w.ops) {
@@ -81,6 +140,8 @@ static RunResult run_once(const Workload& w) {
             }
         }
         const uint64_t t1 = now_ns();
+        r.faults_construct = f1 - f0;
+        r.faults_loop = page_faults() - f1;
         r.total_ms = static_cast<double>(t1 - t0) / 1e6;
         r.checksum = fold_bbo(chk, book.get_bbo());
         r.final_bbo = book.get_bbo();
@@ -90,7 +151,10 @@ static RunResult run_once(const Workload& w) {
         const int kBurst = 1'000'000;
         uint64_t hb = 0;
         const uint64_t b0 = now_ns();
-        for (int i = 0; i < kBurst; ++i) hb = fold_bbo(hb, book.get_bbo());
+        for (int i = 0; i < kBurst; ++i) {
+            escape(&book);  // force a real get_bbo() every iteration
+            hb = fold_bbo_raw(hb, book.get_bbo());
+        }
         const uint64_t b1 = now_ns();
         r.ns_bbo_burst = static_cast<double>(b1 - b0) / kBurst;
         if (hb == 0x1234) std::printf("(unlikely)\n");  // keep the loop alive
@@ -101,24 +165,37 @@ static RunResult run_once(const Workload& w) {
         Book book;
         uint64_t chk = 0;
         uint64_t t_add = 0, t_cancel = 0, t_bbo = 0, t_depth = 0;
+        // One sample per call, for percentiles. Reserved up front so recording
+        // never allocates; the push happens after the second clock read.
+        std::vector<uint32_t> s_add, s_cancel, s_bbo, s_depth;
+        s_add.reserve(w.n_add);
+        s_cancel.reserve(w.n_cancel);
+        s_bbo.reserve(w.n_bbo);
+        s_depth.reserve(w.n_depth);
         for (const Op& op : w.ops) {
             switch (op.type) {
                 case OpType::Add: {
                     const uint64_t a = now_ns();
                     book.add_order(op.id, op.side, op.tick, op.qty);
-                    t_add += now_ns() - a;
+                    const uint64_t d = now_ns() - a;
+                    t_add += d;
+                    s_add.push_back(sample(d));
                     break;
                 }
                 case OpType::Cancel: {
                     const uint64_t a = now_ns();
                     chk += book.cancel_order(op.id);
-                    t_cancel += now_ns() - a;
+                    const uint64_t d = now_ns() - a;
+                    t_cancel += d;
+                    s_cancel.push_back(sample(d));
                     break;
                 }
                 case OpType::Bbo: {
                     const uint64_t a = now_ns();
                     const BBO b = book.get_bbo();
-                    t_bbo += now_ns() - a;
+                    const uint64_t d = now_ns() - a;
+                    t_bbo += d;
+                    s_bbo.push_back(sample(d));
                     chk = fold_bbo(chk, b);
                     break;
                 }
@@ -126,7 +203,9 @@ static RunResult run_once(const Workload& w) {
                     const uint64_t a = now_ns();
                     const std::vector<Level> bids = book.get_bids(10);
                     const std::vector<Level> asks = book.get_asks(10);
-                    t_depth += now_ns() - a;
+                    const uint64_t d = now_ns() - a;
+                    t_depth += d;
+                    s_depth.push_back(sample(d));
                     chk = fold_levels(chk, bids);
                     chk = fold_levels(chk, asks);
                     break;
@@ -143,6 +222,10 @@ static RunResult run_once(const Workload& w) {
         r.ns_cancel = w.n_cancel ? static_cast<double>(t_cancel) / w.n_cancel : 0;
         r.ns_bbo = w.n_bbo ? static_cast<double>(t_bbo) / w.n_bbo : 0;
         r.ns_depth = w.n_depth ? static_cast<double>(t_depth) / w.n_depth : 0;
+        r.p_add = percentiles(s_add);
+        r.p_cancel = percentiles(s_cancel);
+        r.p_bbo = percentiles(s_bbo);
+        r.p_depth = percentiles(s_depth);
     }
     return r;
 }
@@ -153,24 +236,47 @@ static double median(std::vector<double> v) {
     return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
-static double timer_overhead_ns() {
+// Cost a steady_clock::now() pair adds to every per-call sample: the interval
+// between two back-to-back reads, sampled exactly like a timed call. (The wall
+// time per iteration of this loop is about twice that, because each iteration
+// makes two reads; an earlier version subtracted that figure and so
+// over-corrected every "net" mean by one clock read.)
+struct TimerCost {
+    double mean = 0;
+    Pct pct;
+};
+
+static TimerCost timer_cost() {
     const int n = 1'000'000;
-    uint64_t acc = 0;
-    const uint64_t t0 = now_ns();
+    std::vector<uint32_t> s;
+    s.reserve(n);
+    uint64_t sum = 0;
     for (int i = 0; i < n; ++i) {
         const uint64_t a = now_ns();
-        acc += now_ns() - a;
+        const uint64_t d = now_ns() - a;
+        sum += d;
+        s.push_back(sample(d));
     }
-    const uint64_t t1 = now_ns();
-    (void)acc;
-    return static_cast<double>(t1 - t0) / n;
+    TimerCost t;
+    t.mean = static_cast<double>(sum) / n;
+    t.pct = percentiles(s);
+    return t;
+}
+
+static void print_final(const BBO& b, uint64_t checksum) {
+    std::printf("\nFinal BBO:\n");
+    if (b.has_bid) std::printf("  Bid: %.2f x %ld\n", b.bid_price, b.bid_qty); else std::printf("  Bid: (none)\n");
+    if (b.has_ask) std::printf("  Ask: %.2f x %ld\n", b.ask_price, b.ask_qty); else std::printf("  Ask: (none)\n");
+    std::printf("\nChecksum: %llu\n", (unsigned long long)checksum);
 }
 
 // --perf: exactly one uninstrumented pass, no per-op timers, no bbo burst, so
 // that `perf stat` / `perf record` counters are dominated by the book itself.
 template <class Book>
-static int run_perf(const char* name, const Workload& w) {
+static int run_perf(const char* name, const Workload& w, long gen_faults) {
+    const long f0 = page_faults();
     Book book;
+    const long f1 = page_faults();
     uint64_t chk = 0;
     const uint64_t t0 = now_ns();
     for (const Op& op : w.ops) {
@@ -185,52 +291,78 @@ static int run_perf(const char* name, const Workload& w) {
         }
     }
     const uint64_t t1 = now_ns();
+    const long f2 = page_faults();
     const BBO b = book.get_bbo();
     std::printf("Implementation %s (--perf: single pass, %zu ops): %.2f ms\n", name, w.ops.size(),
                 static_cast<double>(t1 - t0) / 1e6);
-    std::printf("Final BBO:\n");
-    if (b.has_bid) std::printf("  Bid: %.2f x %ld\n", b.bid_price, b.bid_qty); else std::printf("  Bid: (none)\n");
-    if (b.has_ask) std::printf("  Ask: %.2f x %ld\n", b.ask_price, b.ask_qty); else std::printf("  Ask: (none)\n");
-    std::printf("Checksum: %llu\n", (unsigned long long)fold_bbo(chk, b));
+    std::printf("Page faults: workload generation %ld | book construction %ld | timed loop %ld\n", gen_faults,
+                f1 - f0, f2 - f1);
+    print_final(b, fold_bbo(chk, b));
     return 0;
 }
 
 template <class Book>
-static int run_bench(const char* name, const Workload& w, int runs) {
+static int run_bench(const char* name, const Workload& w, int runs, long gen_faults) {
     std::printf("Implementation %s  (%zu ops: %zu add, %zu cancel, %zu bbo, +%zu depth queries; %d runs)\n",
                 name, w.n_add + w.n_cancel + w.n_bbo, w.n_add, w.n_cancel, w.n_bbo, w.n_depth, runs);
+    const TimerCost timer = timer_cost();
     std::vector<double> total, add, cancel, bbo, depth, burst;
-    RunResult last{};
+    std::vector<Pct> p_add, p_cancel, p_bbo, p_depth;
+    RunResult first{}, last{};
     for (int i = 0; i < runs; ++i) {
         last = run_once<Book>(w);
+        if (i == 0) first = last;
         total.push_back(last.total_ms);
         add.push_back(last.ns_add);
         cancel.push_back(last.ns_cancel);
         bbo.push_back(last.ns_bbo);
         depth.push_back(last.ns_depth);
         burst.push_back(last.ns_bbo_burst);
-        std::printf("  run %d: total %.2f ms | add %.1f ns | cancel %.1f ns | bbo %.1f ns | depth(10+10) %.1f ns\n",
-                    i + 1, last.total_ms, last.ns_add, last.ns_cancel, last.ns_bbo, last.ns_depth);
+        p_add.push_back(last.p_add);
+        p_cancel.push_back(last.p_cancel);
+        p_bbo.push_back(last.p_bbo);
+        p_depth.push_back(last.p_depth);
+        std::printf("  run %d: total %.2f ms | add %.1f ns | cancel %.1f ns | bbo %.1f ns | depth(10+10) %.1f ns"
+                    " | bbo burst %.2f ns\n",
+                    i + 1, last.total_ms, last.ns_add, last.ns_cancel, last.ns_bbo, last.ns_depth,
+                    last.ns_bbo_burst);
     }
-    const double ovh = timer_overhead_ns();
+    const double ovh = timer.mean;
     auto net = [&](double raw) { return raw > ovh ? raw - ovh : 0.0; };
-    std::printf("\nMedian of %d runs (impl %s):          raw      net of timer overhead\n", runs, name);
+    std::printf("\nMedian of %d runs (impl %s):          raw   net of timer cost\n", runs, name);
     std::printf("  Total time        : %10.2f ms   (uninstrumented pass, %zu ops)\n", median(total), w.ops.size());
     std::printf("  ns / add_order    : %10.1f   %10.1f\n", median(add), net(median(add)));
     std::printf("  ns / cancel_order : %10.1f   %10.1f\n", median(cancel), net(median(cancel)));
-    std::printf("  ns / get_bbo      : %10.1f   %10.1f   (per-call timing; below timer resolution)\n",
+    std::printf("  ns / get_bbo      : %10.1f   %10.1f   (per-call timing; near timer resolution)\n",
                 median(bbo), net(median(bbo)));
-    std::printf("  ns / get_bbo burst: %10.2f              (1M back-to-back calls on final book)\n",
+    std::printf("  ns / get_bbo burst: %10.2f              (1M back-to-back calls on final book, timed as a block)\n",
                 median(burst));
     std::printf("  ns / depth query  : %10.1f   %10.1f   (get_bids(10) + get_asks(10))\n", median(depth),
                 net(median(depth)));
-    std::printf("  timer overhead    : %10.1f ns per steady_clock::now() pair\n", ovh);
+    std::printf("  timer cost        : %10.1f ns   (mean empty timed interval; subtracted for \"net\")\n", ovh);
 
-    const BBO& b = last.final_bbo;
-    std::printf("\nFinal BBO:\n");
-    if (b.has_bid) std::printf("  Bid: %.2f x %ld\n", b.bid_price, b.bid_qty); else std::printf("  Bid: (none)\n");
-    if (b.has_ask) std::printf("  Ask: %.2f x %ld\n", b.ask_price, b.ask_qty); else std::printf("  Ask: (none)\n");
-    std::printf("\nChecksum: %llu\n", (unsigned long long)last.checksum);
+    // Median over runs of each percentile. Samples include the timer cost, so
+    // the "timer only" row is the floor under every other row.
+    auto row = [&](const char* label, const std::vector<Pct>& ps) {
+        auto med = [&](double Pct::*field) {
+            std::vector<double> v;
+            for (const Pct& p : ps) v.push_back(p.*field);
+            return median(v);
+        };
+        std::printf("  %-14s %8.0f %8.0f %8.0f %8.0f %10.0f\n", label, med(&Pct::p50), med(&Pct::p90),
+                    med(&Pct::p99), med(&Pct::p999), med(&Pct::max));
+    };
+    std::printf("\nPer-call latency percentiles, ns (raw, timer cost included; median of %d runs):\n", runs);
+    std::printf("  %-14s %8s %8s %8s %8s %10s\n", "", "p50", "p90", "p99", "p99.9", "max");
+    row("add_order", p_add);
+    row("cancel_order", p_cancel);
+    row("get_bbo", p_bbo);
+    row("depth (10+10)", p_depth);
+    row("timer only", std::vector<Pct>{timer.pct});
+
+    std::printf("\nPage faults (run 1): workload generation %ld | book construction %ld | timed loop %ld\n",
+                gen_faults, first.faults_construct, first.faults_loop);
+    print_final(last.final_bbo, last.checksum);
     return 0;
 }
 
@@ -377,12 +509,26 @@ static int run_verify(const Workload& w) {
 static void usage() {
     std::printf("usage: bench --impl A|B|C [--runs N] [--ops N] [--seed S]\n"
                 "       bench --impl A|B|C --perf        (single uninstrumented pass for perf)\n"
+                "       bench --gen-only    [--ops N] [--seed S]   (generate the workload only)\n"
                 "       bench --verify      [--ops N] [--seed S]\n");
+}
+
+// Strict unsigned parse for --runs/--ops/--seed: atoi/atoll silently turned
+// "abc" into 0 and "-5" into a huge size_t that crashed in vector::reserve.
+static unsigned long long parse_uint(const char* flag, const char* s, unsigned long long max) {
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long v = std::strtoull(s, &end, 10);
+    if (s[0] == '-' || end == s || *end != '\0' || errno == ERANGE || v > max) {
+        std::fprintf(stderr, "%s expects an integer in [0, %llu], got '%s'\n", flag, max, s);
+        std::exit(1);
+    }
+    return v;
 }
 
 int main(int argc, char** argv) {
     std::string impl;
-    bool verify = false, perf = false;
+    bool verify = false, perf = false, gen_only = false;
     int runs = 5;
     size_t ops = 1'000'000;
     uint32_t seed = 42;
@@ -395,20 +541,38 @@ int main(int argc, char** argv) {
         if (a == "--impl") impl = next("--impl");
         else if (a == "--verify") verify = true;
         else if (a == "--perf") perf = true;
-        else if (a == "--runs") runs = std::atoi(next("--runs"));
-        else if (a == "--ops") ops = static_cast<size_t>(std::atoll(next("--ops")));
-        else if (a == "--seed") seed = static_cast<uint32_t>(std::atoll(next("--seed")));
+        else if (a == "--gen-only") gen_only = true;
+        else if (a == "--runs") runs = static_cast<int>(parse_uint("--runs", next("--runs"), 1000));
+        else if (a == "--ops") ops = static_cast<size_t>(parse_uint("--ops", next("--ops"), 100'000'000));
+        else if (a == "--seed") seed = static_cast<uint32_t>(parse_uint("--seed", next("--seed"), 0xFFFFFFFFull));
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); usage(); return 1; }
     }
-    if (!verify && impl.empty()) { usage(); return 1; }
+    if (!verify && !gen_only && impl.empty()) { usage(); return 1; }
     if (runs < 1) runs = 1;
 
+    const long f0 = page_faults();
     const Workload w = make_workload(ops, seed);
+    const long gen_faults = page_faults() - f0;
+
     if (verify) return run_verify(w);
-    if (impl == "A" || impl == "a") return perf ? run_perf<OrderBookA>("A", w) : run_bench<OrderBookA>("A", w, runs);
-    if (impl == "B" || impl == "b") return perf ? run_perf<OrderBookB>("B", w) : run_bench<OrderBookB>("B", w, runs);
-    if (impl == "C" || impl == "c") return perf ? run_perf<OrderBookC>("C", w) : run_bench<OrderBookC>("C", w, runs);
+    if (gen_only) {
+        // Baseline for perf: `perf stat ./bench --gen-only` counts only what
+        // every --perf run also pays for (workload generation, process start),
+        // so subtracting it leaves the counters of the book itself.
+        uint64_t h = 0;
+        for (const Op& op : w.ops) h = mix(h, op.id ^ static_cast<uint64_t>(op.tick));
+        std::printf("Workload only (--gen-only): %zu ops, %ld page faults during generation\n", w.ops.size(),
+                    gen_faults);
+        std::printf("Workload checksum: %llu\n", (unsigned long long)h);
+        return 0;
+    }
+    if (impl == "A" || impl == "a")
+        return perf ? run_perf<OrderBookA>("A", w, gen_faults) : run_bench<OrderBookA>("A", w, runs, gen_faults);
+    if (impl == "B" || impl == "b")
+        return perf ? run_perf<OrderBookB>("B", w, gen_faults) : run_bench<OrderBookB>("B", w, runs, gen_faults);
+    if (impl == "C" || impl == "c")
+        return perf ? run_perf<OrderBookC>("C", w, gen_faults) : run_bench<OrderBookC>("C", w, runs, gen_faults);
     std::fprintf(stderr, "unknown impl '%s' (expected A, B or C)\n", impl.c_str());
     return 1;
 }
