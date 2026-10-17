@@ -14,6 +14,8 @@
 //                   hash, backward-shift deletion so there are no tombstones).
 //                   Each slot is 16 bytes {id, tick, qty}; the side is derived
 //                   from the tick (tick < 10000 => bid) so it needs no storage.
+//                   id ~0 is the empty-slot marker, so that one id is kept in a
+//                   dedicated spare slot outside the table.
 //  * Cancel       : probe the table for id, read tick, subtract from qty[rank],
 //                   clear the bit if the level became empty, and if that was the
 //                   best, scan the bitmap forward for the new best.
@@ -39,17 +41,20 @@ public:
         table_init(cap);
     }
 
-    // Returns false (and changes nothing) for an out-of-band price, qty <= 0,
-    // or an id that is already live. The band check is what keeps rank()
-    // inside [0, 5000): without it a buy at 120.00 would index qty[-2001].
+    // Returns false (and changes nothing) for an out-of-band, off-tick or
+    // non-finite price, qty <= 0, or an id that is already live. The band
+    // check is what keeps rank() inside [0, 5000): without it a buy at 120.00
+    // would index qty[-2001].
     bool add_order(uint64_t id, Side side, double price, long qty) {
-        return add_order(id, side, to_tick(price), qty);
+        int tick;
+        return price_to_tick(price, tick) && add_order_ticks(id, side, tick, qty);
     }
 
-    bool add_order(uint64_t id, Side side, int tick, long qty) {
+    bool add_order_ticks(uint64_t id, Side side, int tick, long qty) {
         if (!valid_order(side, tick, qty)) return false;
-        if (id == kEmpty) return false;  // reserved as the empty-slot marker
-        if (!table_insert(id, tick, static_cast<int32_t>(qty))) return false;  // duplicate id
+        const bool inserted = id == kEmpty ? spare_insert(tick, static_cast<int32_t>(qty))
+                                           : table_insert(id, tick, static_cast<int32_t>(qty));
+        if (!inserted) return false;  // duplicate id
         SideBook& sb = side == Side::Buy ? bids_ : asks_;
         const int r = rank(side, tick);
         if (sb.qty[r] == 0) {
@@ -148,8 +153,9 @@ private:
         mask_ = cap - 1;
         shift_ = 64 - __builtin_ctzll(cap);
         size_ = 0;
-        slots_.reset(new Slot[cap]);
-        for (size_t i = 0; i < cap; ++i) slots_[i].id = kEmpty;
+        slots_.reset(new Slot[cap + 1]);  // +1: the spare slot, see spare()
+        for (size_t i = 0; i <= cap; ++i) slots_[i].id = kEmpty;
+        spare().qty = 0;
     }
 
     void grow() {
@@ -158,6 +164,7 @@ private:
         table_init(cap_ * 2);
         for (size_t i = 0; i < old_cap; ++i)
             if (old[i].id != kEmpty) table_insert(old[i].id, old[i].tick, old[i].qty);
+        spare() = old[old_cap];
     }
 
     bool table_insert(uint64_t id, int tick, int32_t qty) {
@@ -175,7 +182,7 @@ private:
     bool table_erase(uint64_t id, int& tick, int32_t& qty) {
         size_t i = index_of(id);
         while (true) {
-            if (slots_[i].id == kEmpty) return false;
+            if (slots_[i].id == kEmpty) return id == kEmpty && spare_erase(tick, qty);
             if (slots_[i].id == id) break;
             i = (i + 1) & mask_;
         }
@@ -198,6 +205,30 @@ private:
             j = (j + 1) & mask_;
         }
         slots_[hole].id = kEmpty;
+        return true;
+    }
+
+    // kEmpty doubles as the empty-slot marker, so an order whose id is ~0 cannot
+    // live in the table. It gets one spare slot instead, which keeps C accepting
+    // the full uint64_t id range like A and B. The spare is slots_[cap_], one
+    // past the probed range (indices are masked to < cap_), and qty > 0 marks it
+    // live since every live order has qty >= 1. Keeping it in the heap array
+    // rather than adding members leaves sizeof(OrderBookC) unchanged: adding
+    // three unused members alone measurably shifted impl C's total time.
+    // Only the add path's existing id check and the erase miss path touch it.
+    Slot& spare() { return slots_[cap_]; }
+
+    bool spare_insert(int tick, int32_t qty) {
+        if (spare().qty > 0) return false;
+        spare() = Slot{kEmpty, tick, qty};
+        return true;
+    }
+
+    bool spare_erase(int& tick, int32_t& qty) {
+        if (spare().qty <= 0) return false;
+        tick = spare().tick;
+        qty = spare().qty;
+        spare().qty = 0;
         return true;
     }
 

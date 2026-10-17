@@ -1,7 +1,10 @@
 bench
+bench_san
+test_orderbook
+test_orderbook_san
 bench.dSYM/
 build/
-results/*.data
+results/**/*.data
 .DS_Store
 # viva preparation notes: keep local, never push
 VIVA*.md

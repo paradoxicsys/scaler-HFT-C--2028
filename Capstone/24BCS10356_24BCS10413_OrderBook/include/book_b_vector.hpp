@@ -9,15 +9,17 @@
 //  * Price levels : std::vector<PriceLevel> kept sorted so that the *back* of
 //                   the vector is the best price (bids ascending, asks
 //                   descending). Inserting a brand-new level is a binary
-//                   search + vector::insert (memmove); the best-price end is
-//                   the cheap end.
+//                   search + vector::insert, which moves every later
+//                   PriceLevel one slot (element-wise moves, since each holds
+//                   a vector); the best-price end is the cheap end.
 //  * Best price   : levels.back()  (O(1), contiguous memory)
 //  * Cancel       : tree find id -> tick (O(log N)), binary search the level,
 //                   then a linear scan of that level's order list, swap-remove.
 //
 //  N = live orders, L = non-empty levels on the side, k = orders at one level.
-//  add_order   : O(log N) tree insert + O(log L) search (+ O(L) memmove if new level)
+//  add_order   : O(log N) tree insert + O(log L) search (+ O(L) moves if new level)
 //  cancel_order: O(log N) tree find/erase + O(log L) search + O(k) scan
+//                (+ O(L) moves if the level empties)
 //  get_bbo     : O(1)
 //  get_bids/asks(d): O(d) (walk backwards from the end of the vector)
 #pragma once
@@ -34,13 +36,14 @@ public:
         asks_.reserve(kLevelsPerSide);
     }
 
-    // Returns false (and changes nothing) for an out-of-band price, qty <= 0,
-    // or an id that is already live.
+    // Returns false (and changes nothing) for an out-of-band, off-tick or
+    // non-finite price, qty <= 0, or an id that is already live.
     bool add_order(uint64_t id, Side side, double price, long qty) {
-        return add_order(id, side, to_tick(price), qty);
+        int tick;
+        return price_to_tick(price, tick) && add_order_ticks(id, side, tick, qty);
     }
 
-    bool add_order(uint64_t id, Side side, int tick, long qty) {
+    bool add_order_ticks(uint64_t id, Side side, int tick, long qty) {
         if (!valid_order(side, tick, qty)) return false;
         auto ins = where_.emplace(id, Loc{tick, side});
         if (!ins.second) return false;  // duplicate id
